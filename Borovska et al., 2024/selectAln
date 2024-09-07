@@ -1,0 +1,205 @@
+#!/usr/bin/env perl
+
+##
+# selectAln
+#
+# Summary: Selects alignments having a minimum user-defined covariation support
+##
+
+use strict;
+use File::Copy;
+use File::Path qw(mkpath);
+use Getopt::Long qw(:config no_ignore_case);
+
+# If needed, replace this with the actual path to RNA Framework's lib/ directory
+use lib "/path/to/RNAFramework/lib";
+
+use Core::Mathematics qw(:all);
+use Core::Process::Queue;
+use Core::Utils;
+use Data::IO;
+use Term::Progress;
+
+$|++;
+
+my ($help, $output, $tmpdir, $error, $input, 
+    $helixEvalue, $bpEvalue, $helixN, $bpN, 
+    $bpFrac, $helixFrac, $rscape, $statIO, 
+    $progressBar, $queue, $processors, @files);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"              => \$help,
+                "o|output=s"          => \$output,
+                "p|processors=s"      => \$processors,
+                "he|helix-evalue=s"   => \$helixEvalue,
+                "be|bp-evalue=s"      => \$bpEvalue,
+                "hn|helix-n=s"        => \$helixN,
+                "bn|bp-n=s"           => \$bpN,
+                "hf|helix-fraction=s" => \$helixFrac,
+                "bf|bp-fraction=s"    => \$bpFrac,
+                "R|R-scape=s"         => \$rscape ) or help(1);
+
+    $input = $ARGV[0];
+
+};
+
+$output ||= "selected_aln/";
+$rscape ||= which("R-scape");
+$processors ||= 1;
+$helixEvalue //= 0.05;
+$bpEvalue //= 0.1;
+$helixN //= 1;
+$bpN //= 5;
+$bpFrac //= 0.125;
+$helixFrac //= 0.25;
+
+$output =~ s/\/?$/\//;
+$tmpdir = $output . "/tmp/";
+
+help() if ($help);
+
+die "\n[!] Error: Number of processors must be a positive INT >= 1\n\n" if (!isint($processors) || $processors < 1);
+die "\n[!] Error: R-scape is not in PATH\n\n" if (!defined $rscape);
+die "\n[!] Error: Path to R-scape does not point to an executable\n\n" if (!-e $rscape || !-x $rscape);
+die "\n[!] Error: Helix E-value must be >= 0\n\n" if (!isnumeric($helixEvalue) || !ispositive($helixEvalue));
+die "\n[!] Error: Base-pair E-value must be >= 0\n\n" if (!isnumeric($bpEvalue) || !ispositive($bpEvalue));
+die "\n[!] Error: Number of helices must be an INT >= 0\n\n" if (!isint($helixN) || !ispositive($helixN));
+die "\n[!] Error: Number of base-pairs must be an INT >= 0\n\n" if (!isint($bpN) || !ispositive($bpN));
+die "\n[!] Error: Fraction of base-pairs must be comprised between 0 and 1\n\n" if (!isnumeric($bpFrac) || !inrange($bpFrac, [0, 1]));
+die "\n[!] Error: Fraction of helices must be comprised between 0 and 1\n\n" if (!isnumeric($helixFrac) || !inrange($helixFrac, [0, 1]));
+die "\n[!] Error: No input directory provided\n\n" if (!defined $input);
+die "\n[!] Error: Input path does not point to a directory\n\n" if (!-d $input);
+
+if (-e $output) {
+    
+    $error = rmtree($output);
+
+    die "\n[!] Error: $error\n\n" if ($error);
+
+}
+
+mkpath($output, { mode  => 0755,
+                  error => \$error });
+mkpath($tmpdir, { mode  => 0755,
+                  error => \$error });
+mkpath($output . "alignments/", {});
+
+die "\n[!] Error: Unable to create output directory (" . $error->[0]->{each(%{$error->[0]})} . ")\n\n" if (@{$error});
+
+$statIO = Data::IO->new( file  => $output . "stats.out",
+                         mode  => "w+",
+                         flush => 1 );
+$statIO->write(join("\t", qw(#File Tot_helices Cov_helices Tot_pairs Cov_pairs)) . "\n");
+
+print "\n[+] Parsing input directory...";
+
+opendir(my $dh, $input) or die "\n\n[!] Error: Unable to parse input directory ($!)\n\n";
+while(my $file = readdir($dh)) {
+
+    next if ($file !~ /\.(?:stockholm|st[ok])$/);
+
+    push(@files, $file);
+
+}
+closedir($dh);
+
+if (@files) {
+
+    print " " . scalar(@files) . " alignments selected." .
+          "\n[+] Evaluating alignments, please wait...\n\n";
+
+    $progressBar = Term::Progress->new( max   => scalar(@files),
+                                    width => 50 );
+    $queue = Core::Process::Queue->new( processors   => $processors,
+                                        parentOnExit => sub { $progressBar->update(1); },
+                                        stderr       => $output . "errors.out",
+                                        verbosity    => 1 );
+    $progressBar->init("");
+    $queue->enqueue( command   => \&evalAln,
+                     arguments => [ $_ ],
+                     id        => $_ ) for (@files);
+    $queue->start();
+    $queue->waitall();
+
+    print "\n\n[+] All done.\n\n";
+
+}
+else { die "\n\n[!] Error: No stockholm alignment found\n\n"; }
+
+sub evalAln {
+
+    my $file = shift;
+
+    $statIO->forceReopenFh();
+
+    my ($helices, $covHelices, $pairs, $covPairs) = getRscapeCovarying($file);
+
+    $statIO->lock();
+    $statIO->write(join("\t", ($file, $helices, $covHelices, $pairs, $covPairs)));
+    $statIO->unlock();
+
+    if ($covHelices / $helices >= $helixFrac && $covHelices >= $helixN &&
+        $covPairs / $pairs >= $bpFrac && $covPairs >= $bpN) { 
+        
+        copy($file, "$output/alignments/");
+
+        $statIO->lock();
+        $statIO->write("\tPASS\n");
+        $statIO->unlock();
+
+    }
+    else { 
+
+        $statIO->lock();
+        $statIO->write("\tFAIL\n");
+        $statIO->unlock();
+
+    }
+
+}
+
+sub getRscapeCovarying {
+
+    my $file = shift;
+
+    my ($ret, $helices, $covHelices, $pairs, $covPairs);
+    $ret = `R-scape -s -E $bpEvalue --outdir $tmpdir --lancaster --E_hlx $helixEvalue $input/$file`;
+
+    if ($ret =~ m/# BPAIRS\s+(\d+)/) { $pairs = $1; }
+    if ($ret =~ m/# BPAIRS observed to covary (\d+)/) { $covPairs = $1; }
+    while($ret =~ m/^# aggregated LANCASTER/mg) { $helices++; }
+    while($ret =~ m/^# aggregated LANCASTER.+?\*/mg) { $covHelices++; }
+
+    return($helices || 0, $covHelices || 0, $pairs || 0, $covPairs || 0);
+
+}
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ selectAln (using RNA Framework libs v$Core::Utils::VERSION)
+
+ Summary: Selects alignments having a minimum user-defined covariation support
+
+ Usage:   selectAln [options] input_dir/
+
+ Options                               Description
+ -p  or --processors       <int>       Number of processors (>=1, Default: 1)
+ -o  or --output           <string>    Output directory (Default: selected_aln/)
+ -he or --helix-evalue     <float>     E-value threshold to define a helix as significantly covarying (>=0, Default: 0.05)
+ -be or --bp-evalue        <float>     E-value threshold to define a base-pair as significantly covarying (>=0, Default: 0.1)
+ -hn or --helix-n          <int>       Minimum number of helices to covary (>=0, Default: 1)
+ -bn or --bp-n             <int>       Minimum number of base-pairs to covary (>=0, Default: 5)
+ -hf or --helix-fraction   <float>     Minimum fraction of helices to covary (>=0, Default: 0.25)
+ -bf or --bp-fraction      <float>     Minimum fraction of base-pairs to covary (>=0, Default: 0.125)
+ -R  or --R-scape          <string>    Path to R-scape executable (Default: assumes R-scape is in PATH)
+
+HELP
+
+}

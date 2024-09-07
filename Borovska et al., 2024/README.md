@@ -43,7 +43,7 @@ $ cd reference
 $ bowtie2-build --threads <n> Ecoli_TUs.fasta Ecoli_TUs
 ```
 
-If working with paired-end reads, first clip sequencing adapters and merge pairs into long reads. For this purpose we typically use [Cutadapt](https://github.com/marcelm/cutadapt/) and [PEAR](https://cme.h-its.org/exelixis/web/software/pear/), but any other program can be used as well. <br/>
+If working with paired-end reads, first clip sequencing adapters and merge pairs into long reads. For this purpose we typically use [Cutadapt](https://github.com/marcelm/cutadapt/) and [PEAR](https://cme.h-its.org/exelixis/web/software/pear/), but any other program (e.g., [Trimmomatic](http://www.usadellab.org/cms/?page=trimmomatic) and [COPEread](https://sourceforge.net/projects/coperead/)) can be used as well. <br/>
 Note that, if working with single reads, the following steps can be omitted as `rf-map` will take care of clipping the sequencing adapters prior to read mapping:
 
 ```bash
@@ -194,7 +194,8 @@ $ cat consensusFold_out/structures/*.db > all_structs.db
 $ removeRedundantStructs -f 0.9 -o non_redundant.db all_structs.db
 ```
 
-The `-f 0.9` parameter defines the Fowlkes-Mallows index (FMI) threshold to define two structures as being *similar*, hence to be collapsed. The FMI is essentially the geometric mean of positive predictive value (PPV) and sensitivity, and it is a measure of the fraction of base-pairs shared between two structures. It ranges between 0 (totally dissimilar structures) and 1 (identical structures).
+The `-f 0.9` parameter defines the Fowlkes-Mallows index (FMI) threshold to define two structures as being *similar*, hence to be collapsed. The FMI is essentially the geometric mean of positive predictive value (PPV) and sensitivity, and it is a measure of the fraction of base-pairs shared between two structures. It ranges between 0 (totally dissimilar structures) and 1 (identical structures).<br/>
+By default, a random one between the two structures is selected. If the `-c` parameter is specified, the consensus structure (so the structure having only the base-pairs shared by both structures) is reported instead.
 
 After having generated a non-redundant set of strucures, it is possible to proceed with to the covariation analysis:
 
@@ -218,6 +219,7 @@ In the above command line:
 - `-t 1` defines the positional tolerance. This value must __ALWAYS__ be set to 1 when working with full genomes as the relative position of the homologous structure might vary from genome to genome
 - `-k` retains the constructed Stockholm alignments
 
+The database of bacterial genomes to be scanned for homologs can be obtained from NCBI (see [here](https://www.ncbi.nlm.nih.gov/refseq/about/prokaryotes/) for example).
 Depending on the size of the provided database of bacterial genomes, and the number of structures to be evaluated, this process might require up to several days. At the end of the analysis, the `cmbuilder/` output directory will contain a number of constructed alignments in Stockholm format.<br/>
 Alignments can optionally be polished using the `stockholmPolish` tool:
 
@@ -229,7 +231,8 @@ $ stockholmPolish -p <n> cmbuilder/
 The polished alignments can then be prioritized using the `selectAln` script included in this repository:
 
 ```bash
-$ selectAln -he 0.05 -be 0.1 -hn 1 -bn 5 -bf 0.125 stockholmPolish_out/
+# Replace <n> with the number of cores available on your machine
+$ selectAln -p <n> -he 0.05 -be 0.1 -hn 1 -bn 5 -hf 0.25 -bf 0.125 stockholmPolish_out/
 ```
 
 In the above command line:
@@ -238,6 +241,7 @@ In the above command line:
 - `-be 0.1` defines the E-value threshold to define a base-pair as significantly covarying
 - `-hn 1` defines the minimum number of helices that need to covary to keep an alignment
 - `-bn 5` defines the minimum number of base-pairs that need to covary to keep an alignment
+- `-hf 0.25` defines the minimum fraction of helices that need to covary (according to the `-he` threshold) to keep an alignment
 - `-bf 0.125` defines the minimum fraction of base-pairs that need to covary (according to the `-be` threshold) to keep an alignment
 
 The `selected_aln/` output directory will contain:

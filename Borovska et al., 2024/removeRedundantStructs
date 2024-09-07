@@ -1,0 +1,168 @@
+#!/usr/bin/env perl
+
+##
+# removeRedundantStructs
+#
+# Summary: Removes duplicate (or similar) structures
+##
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case);
+
+# If needed, replace this with the actual path to RNA Framework's lib/ directory
+use lib "/path/to/RNAFramework/lib";
+
+use Core::Mathematics qw(:all);
+use Data::IO;
+use Data::IO::Sequence;
+use RNA::Utils;
+
+$|++;
+
+my ($help, $minFMI, $output, $structIO, 
+    $input, $outIO, $relaxed, $lastId, 
+    $consensus, $lastSeq, $read, $left, 
+    @last);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"      => \$help,
+                "f|fmi=s"     => \$minFMI,
+                "o|output=s"  => \$output,
+                "x|relaxed"   => \$relaxed,
+                "c|consensus" => \$consensus ) or help(1);
+
+    $input = $ARGV[0];
+
+};
+
+$output ||= "non_redundant.db";
+$minFMI ||= 0.9;
+$read = $left = 0;
+
+help() if ($help);
+
+die "\n[!] Error: FMI threshold must be comprised between 0 and 1\n\n" if (!isnumeric($minFMI) || !inrange($minFMI, [0, 1]));
+die "\n[!] Error: No input structure file provided\n\n" if (!defined $input);
+die "\n[!] Error: Provided input structure file does not exist\n\n" if (!-e $input);
+
+$outIO = Data::IO->new( file  => $output,
+                        mode  => "w",
+                        flush => 1 );
+
+print "\n[+] Parsing structure file...";
+
+$structIO = Data::IO::Sequence->new(file => $input);
+
+while(my $e1 = $structIO->read()) {
+
+    my $curId = $e1->id();
+    $curId =~ s/_c\d+$//;
+    $read++;
+
+    if ($lastId ne $curId || $structIO->eof()) {
+
+        push(@last, $e1->structure()) if ($lastId eq $curId);
+
+        if (defined $lastId) {
+
+            for(my $i = 0; $i < @last; $i++) {
+
+                for(my $j = 1; $j < @last; $j++) {
+
+                    next if ($i == $j);
+
+                    my $fmi = fmi($last[$i], $last[$j], $relaxed);
+
+                    if ($fmi >= $minFMI) {
+
+                        $last[$i] = consensusStruct($last[$i], $last[$j]) if ($consensus);
+
+                        splice(@last, $j, 1);
+                        $i--;
+
+                        last;
+
+                    }
+
+                }
+
+            }
+
+            for (0 .. $#last) { 
+                
+                $outIO->write(">" . $lastId . "_c" . $_ . "\n" . $lastSeq . "\n" . $last[$_] . "\n"); 
+                $left++;
+
+            }
+
+        }
+
+        @last = $lastId ne $curId ? ($e1->structure()) : ();
+        $lastId = $curId;
+        $lastSeq = $e1->sequence();
+
+    }
+    else { push(@last, $e1->structure()); }
+
+}
+
+for (0 .. $#last) { 
+    
+    $outIO->write(">" . $lastId . "_c" . $_ . "\n" . $lastSeq . "\n" . $last[$_] . "\n");
+    $left++;
+
+}
+
+print "\n[i] $left/$read (" . sprintf("%.2f", $left / $read * 100) . "%) structures written to \"$output\"." .
+      "\n[+] All done.\n\n";
+
+sub consensusStruct {
+
+    my ($struct1, $struct2) = @_;
+
+    my (@consensus, %bp);
+    @consensus = (".") x length($struct1);
+
+    $bp{join("-", @$_)}++ for (listpairs($struct1));
+    $bp{join("-", @$_)}++ for (listpairs($struct2));
+
+    foreach my $bp (grep { $bp{$_} == 2 } keys %bp) {
+
+        my @bp = split /-/, $bp;
+        $consensus[$bp[0]] = "(";
+        $consensus[$bp[1]] = ")";
+
+    }
+
+    return(join("", @consensus));
+
+}
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ removeRedundantStructs (using RNA Framework libs v$Core::Utils::VERSION)
+
+ Summary: Removes duplicate (or similar) structures
+
+ Usage:   removeRedundantStructs [options] input_structures.db
+
+ Options                           Description
+ -o or --output       <string>     Output file (Default: non_redundant.db)
+ -f or --fmi          <float>      Fowlkes-Mallows index (FMI) threshold to consider two structures 
+                                   similar (0-1, Default: 0.9)
+ -x  or --relaxed                  When calculating the FMI, a base-pair i-j is considered to be present 
+                                   in both structures also if (i+1)-j, (i-1)-j, i-(j-1), or i-(j+1) exists
+ -c or --consensus                 When two structures are within the similarity threshold, instead of
+                                   retaining a random one, the consensus structure is retained (so the
+                                   structure composed by the base-pairs common to both structures)
+
+HELP
+
+}
