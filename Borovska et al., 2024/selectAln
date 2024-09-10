@@ -92,7 +92,7 @@ die "\n[!] Error: Unable to create output directory (" . $error->[0]->{each(%{$e
 $statIO = Data::IO->new( file  => $output . "stats.out",
                          mode  => "w+",
                          flush => 1 );
-$statIO->write(join("\t", qw(#File Tot_helices Cov_helices Tot_pairs Cov_pairs)) . "\n");
+$statIO->write(join("\t", qw(#File Tot_helices Cov_helices Tot_pairs Cov_pairs Status)) . "\n");
 
 print "\n[+] Parsing input directory...";
 
@@ -137,25 +137,21 @@ sub evalAln {
 
     my ($helices, $covHelices, $pairs, $covPairs) = getRscapeCovarying($file);
 
-    $statIO->lock();
-    $statIO->write(join("\t", ($file, $helices, $covHelices, $pairs, $covPairs)));
-    $statIO->unlock();
-
     if ($covHelices / $helices >= $helixFrac && $covHelices >= $helixN &&
         $covPairs / $pairs >= $bpFrac && $covPairs >= $bpN) { 
         
         copy($file, "$output/alignments/");
 
         $statIO->lock();
-        $statIO->write("\tPASS\n");
+        $statIO->write(join("\t", ($file, $helices, $covHelices, $pairs, $covPairs, "PASS")) . "\n");
         $statIO->unlock();
 
     }
     else { 
 
         $statIO->lock();
-        $statIO->write("\tFAIL\n");
-        $statIO->unlock();
+        $statIO->write(join("\t", ($file, $helices, $covHelices, $pairs, $covPairs, "FAIL")) . "\n");
+        $statIO->unlock();;
 
     }
 
