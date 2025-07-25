@@ -1,0 +1,356 @@
+#!/usr/bin/env perl
+
+##
+#  mafBlockFromStruct
+#
+#  Extracts genomic regions corresponding to a transcript-level
+#  structures of interest from MAF files
+##
+
+use strict;
+use File::Basename;
+use File::Path qw(mkpath);
+use Getopt::Long qw(:config no_ignore_case);
+
+# If needed, replace this with the actual path to RNA Framework's lib/ directory
+use lib "/path/to/RNAFramework/lib";
+
+use Core::Mathematics qw(:all);
+use Core::Process::Queue;
+use Core::Utils;
+use Data::IO::Sequence;
+use Data::Sequence::Utils;
+use Term::Progress;
+
+$|++;
+
+my ($stoichiomFile, $annoFile, $refPrefix, $mafDir, 
+    $structDir, $pathToTs2Genome, $pathToMafParse, $tmpDir, 
+    $outDir, $overwrite, $error, $processManager,
+    $processors, $rmDupSeq, $progressBar, $completed, 
+    $help, $logDir, @files);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"                => \$help,
+                "o|output=s"            => \$outDir,
+                "ow|overwrite"          => \$overwrite,
+                "p|processors=s"        => \$processors,
+                "rd|rmDupSeq"           => \$rmDupSeq,
+                "md|mafDir=s"           => \$mafDir,
+                "sf|stoichiomFile=s"    => \$stoichiomFile,
+                "af|annoFile=s"         => \$annoFile,
+                "sd|structDir=s"        => \$structDir,
+                "rp|refPrefix=s"        => \$refPrefix,
+                "t2g|pathToTs2Genome=s" => \$pathToTs2Genome,
+                "mp|pathToMafParse=s"   => \$pathToMafParse ) or help(1);
+
+};
+
+help() if ($help);
+
+$processors ||= 40;
+$refPrefix ||= "hg38";
+$pathToTs2Genome ||= which("transcriptome2genome");
+$pathToMafParse ||= which("maf_parse");
+$outDir ||= "extracted_blocks/";
+$outDir =~ s/\/?$/\//;
+$tmpDir = "${outDir}tmp/";
+$logDir = "${outDir}logs/";
+$completed = 0;
+
+die "\n  [!] Error: Number of processors must be an INT >= 1\n\n" if (!isint($processors) || !ispositive($processors));
+die "\n  [!] Error: No reference genome prefix specified\n\n" if (!defined $refPrefix);
+die "\n  [!] Error: No path to transcriptome2genome specified\n\n" if (!defined $pathToTs2Genome);
+die "\n  [!] Error: Provided path to transcriptome2genome does not exist\n\n" if (!-e $pathToTs2Genome);
+die "\n  [!] Error: No path to maf_parse specified\n\n" if (!defined $pathToMafParse);
+die "\n  [!] Error: Provided path to maf_parse does not exist\n\n" if (!-e $pathToMafParse);
+die "\n  [!] Error: No annotation file provided\n\n" if (!defined $annoFile);
+die "\n  [!] Error: Provided annotation file does not exist\n\n" if (!-e $annoFile);
+die "\n  [!] Error: No structure directory provided\n\n" if (!defined $structDir);
+die "\n  [!] Error: Provided structure directory does not exist\n\n" if (!-d $structDir);
+die "\n  [!] Error: No MAF files directory provided\n\n" if (!defined $mafDir);
+die "\n  [!] Error: Provided MAF files directory does not exist\n\n" if (!-d $mafDir);
+
+$mafDir =~ s/\/?$/\//;
+$structDir =~ s/\/?$/\//;
+
+print "\n[+] Making output directory...";
+
+if (-e $outDir) {
+
+    if ($overwrite) {
+
+        $error = rmtree($outDir);
+
+        die "\n\n[!] Error: " . $error . "\n\n" if ($error);
+
+    }
+    else { die "\n\n  [!] Error: Output directory already exists." .
+               "\n    Please use -ow (or --overwrite) to overwrite output directory\n\n"; }
+
+}
+
+mkpath("${outDir}/ungapped/", { mode  => 0755,
+                                error => \$error });
+mkpath("${outDir}/stockholms/", { mode  => 0755,
+                                  error => \$error });
+mkpath($logDir, { mode  => 0755,
+                  error => \$error });                          
+mkpath($tmpDir, { mode  => 0755,
+                  error => \$error });
+
+die "\n\n [!] Error: Unable to create output directory (" . $error->[0]->{each(%{$error->[0]})} . ")\n\n" if (@{$error});
+
+open(my $fh, "<", $stoichiomFile) or die "\n\n [!] Error: Unable to open stoichiometry file ($!)\n\n";
+open(my $th, ">", "${tmpDir}windows.tsLevel.bed") or die "\n\n [!] Error: Unable to write temporary window file ($!)\n\n";
+while(<$fh>) {
+
+    next if (substr($_, 0, 1) eq "#");
+
+    chomp();
+
+    my ($basename, @row, @files);
+    @row = split /\t/;
+    $basename = $row[0] . "_" . $row[1] . "-" . $row[2];
+    @files = glob("${structDir}$basename*");
+
+    next if (!@files);
+
+    print $th join("\t", @row[0,3], $row[4] + 1, $basename) . "\n";
+
+}
+close($th);
+close($fh);
+
+die "\n\n  [!] Error: No structure file matching IDs in stoichiometry file\n\n" if (!-s "${tmpDir}windows.tsLevel.bed");
+
+print "\n[+] Converting to genomic coordinates...\n";
+
+system("$pathToTs2Genome -a $annoFile -b12 -o ${tmpDir}windows.genomeLevel.bed ${tmpDir}windows.tsLevel.bed");
+
+print "[+] Splitting windows by chromosome...";
+
+open($fh, "<", "${tmpDir}windows.genomeLevel.bed") or die "\n\n  [!] Error: Unable to parse genome-level BED file ($!)\n\n";
+while(<$fh>) {
+
+    chomp();
+
+    my ($file, @row);
+    @row = split /\t/;
+    $file = $row[0] . "_" . $row[3] . ".bed";
+
+    if (!-e $mafDir . $row[0] . ".maf") {
+
+        warn "\n  [!] Warning: MAF file for " . $row[0] . " is missing. Skipping window...\n";
+
+        next;
+
+    }
+
+    open(my $th, ">", "${tmpDir}$file") or die "\n\n  [!] Error: Unable to write temporary file $file ($!)\n\n";
+    select((select($th), $|=1)[0]);
+
+    print $th "$_\n";
+
+    close($th);
+
+    push(@files, [$file, $row[5]]);
+
+}
+close($fh);
+
+print "\n[+] Extracting MAF blocks (this might take a while)...\n\n";
+
+$processManager = Core::Process::Queue->new( processors   => $processors,
+                                             stderr       => "/dev/null",
+                                             parentOnExit => sub { $progressBar->update(1); },
+                                             verbosity    => -1 );
+$progressBar = Term::Progress->new( max     => scalar(@files),
+                                    width   => 50,
+                                    colored => 1 );
+
+$processManager->enqueue( command   => \&extractMafBlocks,
+                          arguments => $_,
+                          id        => $_->[0],
+                          stdout    => $logDir . $_->[0] . ".extractMafBlocks.log",
+                          stderr    => $logDir . $_->[0] . ".extractMafBlocks.log" ) for (@files);
+
+$progressBar->init("");
+$processManager->start();
+$processManager->waitall();
+
+while (my $process = $processManager->dequeue()) { if (my $exitCode = $process->exitcode()) { $completed += $exitCode->[0]; } }
+
+print "\n\n[+] Extraction was successful for " . sprintf("%.2f", $completed / @files * 100) . "\% of the blocks";
+
+cleanup();
+
+print "\n[+] All done.\n\n";
+
+sub cleanup {
+
+    my @logs = map { -s $_ } glob("${logDir}*.log");
+
+    if (@logs && sum(@logs)) { warn "\n\n  [!] Warning: Execution completed with warnings/errors. Please check the logs\n"; }
+    else {
+
+        unlink(glob($tmpDir . "*"));
+        unlink(glob($logDir . "*"));
+
+        rmtree($tmpDir);
+        rmtree($logDir);
+
+    }
+
+}
+
+sub extractMafBlocks {
+
+    my ($file, $strand) = @_;
+
+    my ($chr, $window) = $file =~ /^(chr\w+)_(.+?)\.bed$/;
+
+    system("$pathToMafParse -o MAF -g ${tmpDir}$file ${mafDir}$chr.maf > ${tmpDir}$window.maf");
+
+    if (-s "$tmpDir/$window.maf") {
+
+        my ($structIO, $entry, $ungappedRef, $gappedRef,
+            $maxIdLen, $nBlocks, @structFiles, %sequences, %blockLen);
+        @structFiles = glob("${structDir}$window*.db");
+
+        die "\nNo structure files for $window in \"$structDir\"\n" if (!@structFiles);
+
+        $structIO = Data::IO::Sequence->new(file => $structFiles[0]);
+        $entry = $structIO->read();
+
+        die "\n[!] Error: Unable to read structure from \"" . $structFiles[0] . "\"\n" if (!$entry);
+
+        $maxIdLen = 12; # length of "#=GC SS_cons"
+        $nBlocks = 0;
+
+        open(my $fh, "<", "${tmpDir}$window.maf") or die "\n[!] Error: Unable to read \"${tmpDir}$window.maf\" ($!)\n";
+        while(<$fh>) {
+
+            if (substr($_, 0, 1) eq "a") { $nBlocks++; }
+            elsif (substr($_, 0, 1) eq "s") {
+
+                my @row = split " ";
+
+                next if (@row != 7);
+
+                $blockLen{$nBlocks} = length($row[6]);
+
+                push(@{$sequences{$row[1]}}, [$row[6], $nBlocks - 1]);
+                $maxIdLen = max(length($row[1]), $maxIdLen);
+
+            }
+
+        }
+        close($fh);
+
+        die "\n[!] Error: Unable to find reference sequence $refPrefix.$chr in MAF file \"${tmpDir}$window.maf\"\n" if (!exists $sequences{"$refPrefix.$chr"});
+
+        # Stitches together MAF blocks, accounting for missing ones (gap-only)
+        foreach my $id (keys %sequences) {
+
+            my (@sequence, @blocks);
+            @blocks = @{$sequences{$id}};
+            @sequence = map { "-" x $blockLen{$_} } 1 .. $nBlocks;
+            $sequence[$_->[1]] = $_->[0] for (@blocks);
+            $sequences{$id} = join("", @sequence);
+
+        }
+
+        $gappedRef = uc($sequences{"$refPrefix.$chr"});
+        $ungappedRef = $gappedRef;
+        $ungappedRef =~ s/-//g;
+
+        if ($strand eq "-") {
+
+            die "\n[!] Error: Reference sequence does not match sequence in structure file for $window\n" if (dnarevcomp($ungappedRef) ne rna2dna($entry->sequence()));
+
+            %sequences = map { $_ => dnarevcomp($sequences{$_}) } keys %sequences;
+	        $gappedRef = dnarevcomp($gappedRef);
+
+        }
+        else { die "\n[!] Error: Reference sequence does not match sequence in structure file for $window\n" if ($ungappedRef ne rna2dna($entry->sequence())); }
+
+        if ($rmDupSeq) {
+
+            my %ids = map { $sequences{$_} => $_ } keys %sequences;
+            %sequences = map { $ids{$_} => $_ } keys %ids;
+
+        }
+
+        foreach my $structFile (@structFiles) {
+
+            my ($gappedStruct, @structure);
+            $structIO = Data::IO::Sequence->new(file => $structFile);
+            $entry = $structIO->read();
+
+            die "\n[!] Error: Unable to read structure from \"$structFile\"\n" if (!$entry);
+
+            @structure = split //, $entry->structure();
+            $gappedStruct .= $_ ne "-" ? shift(@structure) : "-" for (split //, $gappedRef);
+
+            open($fh, ">", "${outDir}stockholms/" . (fileparse($structFile, ".db"))[0] . ".stockholm") or die "\n[!] Error: Unable to write output Stockholm file for $window ($!)\n";
+            select((select($fh), $|=1)[0]);
+            print $fh "# STOCKHOLM 1.0\n" .
+                    "#=GF AU MAF2Stockholm\n\n";
+            print $fh $_ . (" " x ($maxIdLen - length($_) + 10)) . dna2rna($sequences{$_}) . "\n" for (keys %sequences);
+            print $fh "#=GC SS_cons" . (" " x ($maxIdLen - 2)) . $gappedStruct . "\n" .
+                    "//\n";
+            close($fh);
+
+            open($fh, ">", "${outDir}ungapped/" . (fileparse($structFile, ".db"))[0] . ".fasta") or die "\n[!] Error: Unable to write output ungapped FASTA file for $window ($!)\n";
+            select((select($fh), $|=1)[0]);
+            print $fh ">$_\n" . ($sequences{$_} =~ s/-//gr) . "\n" for (keys %sequences);
+            close($fh);
+
+        }
+
+    }
+    else { die "\n[!] Error: Failed to extract MAF block for $window\n"; }
+
+    return(1);
+
+}
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ mafBlockFromStruct (using RNA Framework libs v$Core::Utils::VERSION)
+
+ Summary: Extracts genomic regions corresponding to a transcript-level
+          structures of interest from MAF files 
+
+ Usage:   mafBlockFromStruct [Options] -md /path/to/MAF/files -sf /path/to/stoichiometries.txt \
+                                       -af /path/to/annotation.bed -sd /path/to/structure/dir  
+
+ Options                                    Description
+ -p   or --processors         <int>         Number of processors to use (>=1, Default: 1)
+ -o   or --output             <string>      Output folder (Default: extracted_blocks/)
+ -ow  or --overwrite                        Overwrites output folder (if the specified folder already exists)
+ -md  or --mafDir             <string>      Path to a directory of MAF files (one per chromosome)
+ -sf  or --stoichiomFile      <string>      Path to a rf-json2rc stoichiometry file
+ -af  or --annoFile           <string>      Path to a BED annotation file
+ -sd  or --structDir          <string>      Path to a directory of structure files (from DRACO deconvolved
+                                            reactivity profiles)
+ -rp  or --refPrefix          <string>      Reference sequence name prefix (Default: hg38)
+                                            Note: reference sequences in the MAF files must be preceded by
+                                                  this prefix (e.g., hg38.chr1, hg38.chr2, etc.)
+ -rd  or --rmDupSeq                         Identical sequences from the extracted MAF blocks are collapsed
+ -t2g or --pathToTs2Genome    <string>      Path to the transcriptome2genome executable (Default: assumes
+                                            transcriptome2genome is in PATH)
+ -mp  or --pathToMafParse     <string>      Path to the maf_parse executable (Default: assumes maf_parse
+                                            is in PATH)
+                                            
+HELP
+
+}

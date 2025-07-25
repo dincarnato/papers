@@ -1,7 +1,7 @@
-# DeConStruct pipeline
+# DeConStruct framework
 
 ## Description
-The DeConStruct pipeline constitutes a generalized framework for the identification of candidate RNA structural switches by ensemble deconvolution analysis of chemical probing data read out by mutational profiling (MaP), and the prioritization of functionally-relevant switches by evolutionary conservation assessment via covariation analysis.
+The DeConStruct framework provides a generalized approach for the identification of candidate RNA structural switches by ensemble deconvolution analysis of chemical probing data read out by mutational profiling (MaP), and the prioritization of functionally-relevant switches by evolutionary conservation assessment via covariation analysis.
 
 
 ## Requirements
@@ -12,11 +12,12 @@ The pipeline relies upon the following components:
 3. [IncaRNAto lab tools](https://github.com/dincarnato/labtools)
 4. [Infernal](https://github.com/EddyRivasLab/infernal) (v1.1.3 or greater)
 5. [R-scape](https://github.com/EddyRivasLab/R-scape) (v2.0.0q or greater)
+6. [BEDTools](https://bedtools.readthedocs.io/en/latest/) (v2.31.1 or greater)
 
 Make sure that the `lib/` folder of RNA Framework is added to the `$PERL5LIB` environment variable:
 
 ```bash
-$ export PERL5LIB=$PERL5LIB:/path/to/RNA/Framework
+$ export PERL5LIB=$PERL5LIB:/path/to/RNAFramework/lib
 ```
 
 ## Running the pipeline
@@ -26,15 +27,16 @@ The DeConStruct pipeline involves a number of discrete steps to go from raw MaP 
 2. Ensemble deconvolution (using DRACO)
 3. Automated construction of structure-informed alignments and covariation analysis (using cm-builder, Infernal and R-scape)
 
-The various steps and possible customizations are described in detail below. The sample command lines exemplify how to replicate the analyses performed in Borovska *et al.*, 2024.<br/>
+The various steps and possible customizations are described in detail below. The sample command lines exemplify how to replicate the analyses performed in Borovska *et al.*, 2025.<br/>
 
 
 ### Read pre-processing &amp; alignment to reference
-Aligment to the reference transcriptome can be performed using any tool. We typically use [Bowtie2](https://bowtie-bio.sourceforge.net/bowtie2/index.shtml) through the `rf-map` module of the RNA Framework. First of all, build the reference transcriptome index:
+Aligment to the reference transcriptome can be performed using any tool. We typically use [Bowtie2](https://bowtie-bio.sourceforge.net/bowtie2/index.shtml) through the `rf-map` module of the RNA Framework. The first step involves building the reference transcriptome index.<br/>
+If analyzing transcriptome-wide DMS-MaPseq *E. coli* data:
 
 ```bash
 # Obtain the E. coli transcriptome reference
-$ wget https://www.incarnatolab.com/downloads/datasets/EcoliEnsembles_Borovska_2024/reference.tar.gz
+$ wget https://www.incarnatolab.com/downloads/datasets/Ensembles_Borovska_2025/reference.tar.gz
 $ tar -xzvf reference.tar.gz
 $ cd reference
 
@@ -43,7 +45,25 @@ $ cd reference
 $ bowtie2-build --threads <n> Ecoli_TUs.fasta Ecoli_TUs
 ```
 
-If working with paired-end reads, first clip sequencing adapters and merge pairs into long reads. For this purpose we typically use [Cutadapt](https://github.com/marcelm/cutadapt/) and [PEAR](https://cme.h-its.org/exelixis/web/software/pear/), but any other program (e.g., [Trimmomatic](http://www.usadellab.org/cms/?page=trimmomatic) and [COPEread](https://sourceforge.net/projects/coperead/)) can be used as well. <br/>
+Alternatively, if analyzing HEK293 5&prime;UTR-MaP data, the reference annotation of interest can be obtained in BED format from the [Table Browser](https://genome.ucsc.edu/cgi-bin/hgTables) of the UCSC Genome database. We recommend using the [MANE](https://www.ncbi.nlm.nih.gov/refseq/MANE/) annotation as this contains a single representative isoform for each gene.<br/>
+Once the reference annotation has been obtained:
+
+```bash
+# Obtain the H. sapiens reference genome
+$ mkdir reference && cd reference
+$ wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz
+$ gunzip hg38.fa.gz
+
+# Extract the MANE annotation to build the transcriptome reference
+# Replace <path to the reference annotation> with the path to the MANE annotation BED12 file
+$ fastaFromBed -nameOnly -split -fi hg38.fa -fo mane.fasta -bed <path to the reference annotation>
+
+# Build the Bowtie2 index
+# Replace <n> with the number of cores available on your machine
+$ bowtie2-build --threads <n> mane.fasta mane
+```
+
+If working with paired-end reads, it is advised to first clip sequencing adapters and merge pairs into long reads. For this purpose we typically use [Cutadapt](https://github.com/marcelm/cutadapt/) and [PEAR](https://cme.h-its.org/exelixis/web/software/pear/), but any other program (e.g., [Trimmomatic](http://www.usadellab.org/cms/?page=trimmomatic) and [COPEread](https://sourceforge.net/projects/coperead/)) can be used as well. <br/>
 Note that, if working with single reads, the following steps can be omitted as `rf-map` will take care of clipping the sequencing adapters prior to read mapping:
 
 ```bash
@@ -62,15 +82,21 @@ In the above example, the two output files from PEAR are merged. The `merged_rea
 Reads can then be aligned to the reference transcriptome:
 
 ```bash
-# Replace <f> with the number of fastq files to be processed in parallel (in this example 1) and <n> with the number of cores available on your machine
+# Replace:
+# <f> with the number of fastq files to be processed in parallel (in this example 1) and <n> with the number of cores available on your machine
 # Note: at least <p> * <n> cores must be available on the machine
-$ rf-map -b2 -cq5 20 -ctn -cmn 0 -cl 90 -mp "--very-sensitive-local --nofw" -b5 6 -p <f> -wt <n> merged_reads.assembled.fastq
+
+# E. coli DMS-MaPseq data
+$ rf-map -b2 -cq5 20 -ctn -cmn 0 -cl 90 -mp "--very-sensitive-local --nofw" -b5 6 -p <f> -wt <n> -bi reference/Ecoli_TUs merged_reads.assembled.fastq
+
+# HEK293 5'UTR-MaP data
+$ rf-map -b2 -cq5 20 -ctn -cmn 0 -cl 90 -mp "--very-sensitive-local --norc" -p <f> -wt <n> -bi reference/mane merged_reads.assembled.fastq
 ```
 
 This will generate the `rf_map/` output folder, containing the aligned reads in BAM format.<br/>
 
-The above command line assumes that libraries have been generated using a protocol that preserves the strandedness of the sequenced reads, particularly a *first-strand* protocol, meaning that reads are expected to align to the reverse complement of the transcript sequences. Therefore, the parameter `--nofw` tells to Bowtie2 to ignore the forward strand. In case of libraries generated using a *second-strand* protocol, meaning that reads are expected to align to the actual transcript sequences, the parameter `--norc` must be specified instead, while both parameters have to be omitted for *unstranded* protocols in which reads have a nearly equal probability of aligning to the transcript sequences, or their reverse complement.<br/>
-The parameter `-b5 6` further removes the 6 5'-most bases of each read. Assuming that reverse transcription has been performed using random hexamers, these bases are discarded to remove potential mispriming artifacts. If using a  *second-strand* protocol instead, this has to be replaced with `-b3 6`. If reverse transcription is non-random primed (i.e., adapters are directly ligated to the RNA, and a primer complementary to the 3' adapter is used to drive reverse transcription), both parameters can be omitted.<br/>
+The above command line assumes that libraries have been generated using a protocol that preserves the strandedness of the sequenced reads, particularly a *first-strand* protocol for the transcriptome-wide DMA-MaPseq library, meaning that reads are expected to align to the antisense strand of the gene, or a *second-strand* protocol for the 5&prime;UTR-MaP library, meaning that reads are expected to directly align to the sense strand of the gene. Therefore, the parameter `--nofw` tells Bowtie2 to ignore the forward strand, while `--norc` causes the reverse strand to be ignored. In case of libraries generated using *unstranded* protocols either parameters must be omitted as reads have a nearly equal probability of aligning to the transcript sequences, or their reverse complement.<br/>
+For the transcriptome-wide DMS-MaPseq library the parameter `-b5 6` further removes the 6 5'-most bases of each read. Assuming that reverse transcription has been performed using random hexamers, these bases are discarded to remove potential mispriming artifacts. If reverse transcription is non-random primed (i.e., adapters are directly ligated to the RNA, and a primer complementary to the 3' adapter is used to drive reverse transcription), this parameter can be omitted (e.g., 5&prime;UTR-MaP libraries).<br/>
 
 
 ### Mutation counting &amp; clean-up
@@ -79,12 +105,17 @@ This step involves processing the alignments into vectors of mutations that will
 ```bash
 # Replace <f> with the number of BAM files to be processed in parallel (in this example 1) and <n> with the number of cores available on your machine
 # Note: at least <p> * <n> cores must be available on the machine
-$ rf-count -p <f> -wt <n> -m -mm -wl 2000 -ds 100 -es -na -ni -md 1 -dc 3 -me 0.1 rf_map/*.bam
+
+# E. coli DMS-MaPseq data
+$ rf-count -p <f> -wt <n> -f reference/Ecoli_TUs.fasta -m -mm -wl 2000 -ds 100 -es -na -ni -md 1 -dc 3 -me 0.1 rf_map/*.bam
+
+# HEK293 5'UTR-MaP data
+$ rf-count -p <f> -wt <n> -f reference/mane.fasta -m -mm -wl 2000 -ds 100 -es -na -ni -md 1 -dc 3 -me 0.1 rf_map/*.bam
 ```
 
-A number of filtering steps are applied to only retain high-quality reads/mutations. Please note that these steps have been optimized for [DMS-MaPseq experiments](https://pubmed.ncbi.nlm.nih.gov/27819661/) read out using group II intron reverse transcriptases (e.g., TGIRT-III), and might need to be carefully optimized for SHAPE-MaP experiments: 
+A number of filtering steps are applied to only retain high-quality reads/mutations. Please note that these steps have been optimized for [DMS-MaPseq experiments](https://pubmed.ncbi.nlm.nih.gov/27819661/) read out using group II intron reverse transcriptases (e.g., TGIRT-III and Induro), and might need to be carefully optimized for SHAPE-MaP experiments: 
 
-- The `-ds 100` parameter causes reads covering &lt; 100 nt of the reference transcript to be discarded. This allows discarding low-quality alignments in which several bases have been clipped by Bowtie2.
+- The `-ds <N>` parameter causes reads covering &lt; *N* nt of the reference transcript to be discarded. This allows discarding low-quality alignments in which several bases have been clipped by Bowtie2.
 - The `-es` parameter causes mutations residing within low-quality segments of the read (so, mutations residing between bases whose quality score is &lt; 20) to be discarded.
 - The `-na` parameter causes ambiguously aligned deletions (i.e., deletions residing within repetitive regions, for which it's impossible to determine which of the repeats were actually deleted) to be discarded.
 - The `-ni` parameter causes insertions to be ignored (as these account for &lt; 1% of mutations in DMS-MaPseq experiments).
@@ -127,7 +158,7 @@ $ rf-json2rc -j dataset.json -r rf_count/merged_reads.assembled.rc -ec 1000 -mom
 
 where `dataset.json` and `rf_count/merged_reads.assembled.rc` are respectively the JSON output generated by DRACO and the RC output generated by `rf-count`.
 
-If working with multiple datasets or replicates (e.g., DH5&#593; and TOP10 *E. coli* as in Borovska *et al.*, 2024), multiple files can be specified as a comma-separated list:
+If working with multiple datasets or replicates (e.g., DH5&#593; and TOP10 *E. coli* as in Borovska *et al.*, 2025), multiple files can be specified as a comma-separated list:
 
 ```bash
 $ rf-json2rc -j DH5a.json,TOP10.json -r DH5a.rc,TOP10.rc -ec 1000 -mom 0.35 -e 20 -cf 0.1 -i 0.1 -mcm 0.65 -mcr 0.65 -ki
@@ -149,7 +180,7 @@ The output `rf_json2rc/` folder will contain:
 - An RC file for each analyzed experiment/replicate, containing per-base mutation counts and coverage of the deconvolved conformations for the windows that were matched<br/>
 
 
-### Reactivity normalization &amp; structure modeling
+### Reactivity normalization &amp; structure modelling
 RC files have to be normalized to obtain reactivities that can be used to constrain structure predictions. This step is performed using the `rf-norm` module of the RNA Framework:
 
 ```bash
@@ -173,7 +204,7 @@ Structure modeling can then be performed using the `consensusFold` tool. This to
 $ consensusFold -sl 4.8 -in -0.8 -md 600 -p <n> -g *_norm/
 ```
 
-The `-md 600` parameter defines the maximum allowed base-pairing distance, while the `-sl 4.8` and `-in -0.8` respectively define the *slope* and *intercept* folding parameters. These parameters are highly reagent- and protocol-specific, and ideally they should be optimized for every experiment. We found that 4.8 and -0.8 tend to be optimal parameters across a variety of DMS-MaPseq experiments.
+The `-md 600` parameter defines the maximum allowed base-pairing distance, while the `-sl 4.8` and `-in -0.8` respectively define the *slope* and *intercept* folding parameters. These parameters are highly reagent- and protocol-specific, and ideally they should be optimized for every experiment. For the analysis of 5&prime;UTR-MaP data from HEK293 cells we determined optimal values to be __4.6__ and __-2__ respectively for slope and intercept.
 
 The output `consensusFold_out/` folder will contain two sub-directories:
 
@@ -184,7 +215,7 @@ The output `consensusFold_out/` folder will contain two sub-directories:
 ### Evolutionary conservation assessment by covariation analysis
 This final step allows prioritizing regions of the transcriptome that are under strong purifying selection. The presence of significant covariation is usually a strong evidence for functionality of RNA structures, therefore this step can help mining functional RNA structural switches out of a plethora of structurally-heterogeneous regions identified by DRACO.
 
-This analysis step relies on a modified version of `cm-builder`, which is capable of analyzing entire bacterial genomes. Before proceeding with the covariation analysis, all structures modeled in the previous step need to be consolidated into a single dot-bracket file. It is important to point out that, in some cases, two DRACO-deconvolved reactivity profiles for a same transcriptome region, corresponding to two alternative conformations making up the ensemble for that transcript, might converge on the same (or a very similar) structure during modeling. This can happen for different reasons, such as limits in the thermodynamic model, or conformations sharing a very similar secondary structure but differing at the tertiary structure level.
+This analysis step relies on the `cm-builder` utility. Before proceeding with the covariation analysis, all structures modeled in the previous step need to be consolidated into a single dot-bracket file. It is important to point out that, in some cases, two DRACO-deconvolved reactivity profiles for alternative conformations of a same transcriptome region might converge on the same (or a very similar) structure during modeling. This can happen for different reasons, such as limits in the thermodynamic model, or conformations sharing a very similar secondary structure but differing at the tertiary structure level.
 
 Therefore, prior to performing the covariation analysis, alternative conformations showing very similar secondary structures are collapsed into a single representative structure (to reduce runtimes) using the `removeRedundantStructs` script included in this repository:
 
@@ -194,18 +225,20 @@ $ cat consensusFold_out/structures/*.db > all_structs.db
 $ removeRedundantStructs -f 0.9 -o non_redundant.db all_structs.db
 ```
 
-The `-f 0.9` parameter defines the Fowlkes-Mallows index (FMI) threshold to define two structures as being *similar*, hence to be collapsed. The FMI is essentially the geometric mean of positive predictive value (PPV) and sensitivity, and it is a measure of the fraction of base-pairs shared between two structures. It ranges between 0 (totally dissimilar structures) and 1 (identical structures).<br/>
-By default, a random one between the two structures is selected. If the `-c` parameter is specified, the consensus structure (so the structure having only the base-pairs shared by both structures) is reported instead.
+The `-f 0.9` parameter defines the Fowlkes-Mallows index (FMI) threshold to define two structures as being *similar*, hence to be collapsed. The FMI is essentially the geometric mean of positive predictive value (PPV) and sensitivity, and it is a measure of the fraction of base-pairs shared between two structures. It ranges between 0 (totally dissimilar structures) and 1 (identical structures). Alternatively, if the `-m` flag is also provided, the modified FMI (mFMI) is used instead, which also takes into account unpaired bases when calculating the similarity between two structures.<br/>
+By default, a random one between the two structures is selected. If the `-c` parameter is specified, the consensus structure (so the structure having only the base-pairs shared by both structures) is reported instead.<br/>
+After having generated a non-redundant set of strucures, it is possible to proceed with to the covariation analysis. Two slightly different procedures are provided, depending on whether the analysis is being performed on RNA structures derived from bacteria or higher eukaryotes.<br/>
 
-After having generated a non-redundant set of strucures, it is possible to proceed with to the covariation analysis:
+
+#### Analysis of bacterial RNA structures
+When analyzing structures derived from bacteria (e.g., *E. coli*), the `cm-builder` tool can be run directly:
 
 ```bash
 # Replace:
 # <path to FASTA file of bacterial genomes> with the path to a multi-FASTA file containing the genomic sequences of bacteria to be searched for structural homologs
 # <path to reference organism genome> with the path to a FASTA file containg the sequence of the genome of the organism the structures have been extracted from (in this case, E. coli U00096.3, available from: https://www.ncbi.nlm.nih.gov/nuccore/545778205)
 # <n> with the number of cores available on your machine
-$ cm-builder -m non_redundant.db -d <path to FASTA file of bacterial genomes> -s <path to reference organism genome> -q 0.75 -t 1 -k -c <n>
--o cmbuilder/ -M cmbuilder/tmp/ -g -B -T 20 -I 10 -N -S
+$ cm-builder -m non_redundant.db -d <path to FASTA file of bacterial genomes> -s <path to reference organism genome> -q 0.75 -t 1 -k -c <n> -o cmbuilder/ -M cmbuilder/tmp/ -g -B -T 20 -I 10 -N -S
 ```
 
 In the above command line:
@@ -221,7 +254,48 @@ In the above command line:
 
 The database of bacterial genomes to be scanned for homologs can be obtained from NCBI (see [here](https://www.ncbi.nlm.nih.gov/refseq/about/prokaryotes/) for example).
 Depending on the size of the provided database of bacterial genomes, and the number of structures to be evaluated, this process might require up to several days. At the end of the analysis, the `cmbuilder/` output directory will contain a number of constructed alignments in Stockholm format.<br/>
-Alignments can optionally be polished using the `stockholmPolish` tool:
+
+
+#### Analysis of RNA structures from higher eukaryotes
+When analyzing structures derived from higher eukaryotes (e.g., *H. sapiens*), directly running the `cm-builder` tool would prove extremely challenging due to the size of eukaryotic genomes. Therefore, to facilitate the identification of homologous sequences from other organisms, we developed the `mafBlockFromStruct` tool (available from this repository), which enables the automated extraction of candidate homologous regions from [MAF files](https://genome.ucsc.edu/FAQ/FAQformat.html#format5):
+
+```bash
+# Replace:
+# <path to folder of MAF files> with the path to a folder of MAF files, one per chromosome
+# <path to rf-json2rc stoichiometry file> with the path to the stoichiometries.txt file generated by rf-json2rc from DRACO's output
+# <path to structure files> with the path to the folder containing structures predicted from DRACO deconvolved profiles (e.g., using consensusFold of rf-fold)
+# <path to BED transcriptome annotation> with the path to a BED12 file containing the transcripts used for the generation of the transcriptome reference used for read mapping (e.g., the MANE annotation)
+# <path to transcriptome2genome> with the path to the transcriptome2genome tool (available from the "labtools" repository)
+# <n> with the number of cores available on your machine
+$ mafBlockFromStruct -p <n> -md <path to folder of MAF files> -sf <path to rf-json2rc stoichiometry file> -sd <path to structure files> -af <path to BED transcriptome annotation> -t2g <path to transcriptome2genome>
+```
+
+The above command relies upon 2 tools: `maf_parse` (part of the [PHAST](http://compgen.cshl.edu/phast/) package) and `transcriptome2genome` (available from the [IncaRNAto lab's tools](https://github.com/dincarnato/labtools) repository). The program extracts the relevant regions (corresponding to the provided DRACO-deconvolved structures) from the MAF files. MAF files can be obtained from the [UCSC Genome database](https://hgdownload.soe.ucsc.edu/goldenPath/hg38/) (e.g., [multiz100way](https://hgdownload.soe.ucsc.edu/goldenPath/hg38/multiz100way/maf/)).</br>
+The output folder will contain:
+
+- The `stockholms/` folder, containing the Stockholm-formatted alignments from the relevant MAF blocks. These files preserve the alignment of the original MAF files.
+- The `ungapped/` folder, containing the ungapped homologous sequences extracted from the MAF blocks
+
+At this point, it is possible to directly proceed with the prioritization of the candidate structures (next paragraph) by using the Stockholm files provided in the `stockholms/` folder, or, alternatively, the `cm-builder` analysis can be run by using the ungapped sequences as database (`-d` parameter). As the alignments generated by `cm-builder` are structurally-informed, this approach can recover additional covariations as compared to using pre-computed sequence-driven alignments as those extracted from MAF files.<br/>
+For the analysis of higher eukaryots it is advisable to use slightly relaxed parameters as compared to bacterial genomes:
+
+```bash
+# Replace:
+# <path to ungapped FASTA file> with the relevant file of ungapped homologus sequences extracted using mafBlockFromStruct
+# <path to reference transcript> with the path to a FASTA file containg the reference transcript's sequence
+# <n> with the number of cores available on your machine
+$ cm-builder -m non_redundant.db -d <path to ungapped FASTA file> -s <path to reference transcript> -q 0.75 -t 1 -k -c <n> -o cmbuilder/ -M cmbuilder/tmp/ -B -T 20 -I 5 -N -S -b 0.35
+```
+
+In the above command line:
+
+- the `-g` parameter has been removed, as compared to the analysis of bacterial genomes, to only use the top (sense) strand
+- the `-I` parameter has been decreased from 10 for the analysis of bacterial genomes, to __5__
+- the `-b` parameter has been decreased from the default 0.55 for the analysis of bacterial genomes, to __0.35__
+
+
+#### Prioritization of candidate structures
+Stockholm alignments can optionally be polished using the `stockholmPolish` tool:
 
 ```bash
 # Replace <n> with the number of cores available on your machine

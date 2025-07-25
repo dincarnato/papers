@@ -22,7 +22,7 @@ $|++;
 my ($help, $minFMI, $output, $structIO, 
     $input, $outIO, $relaxed, $lastId, 
     $consensus, $lastSeq, $read, $left, 
-    @last);
+    $mfmi, @last);
 
 do {
 
@@ -32,7 +32,8 @@ do {
                 "f|fmi=s"     => \$minFMI,
                 "o|output=s"  => \$output,
                 "x|relaxed"   => \$relaxed,
-                "c|consensus" => \$consensus ) or help(1);
+                "c|consensus" => \$consensus,
+                "m|mfmi"      => \$mfmi ) or help(1);
 
     $input = $ARGV[0];
 
@@ -74,7 +75,7 @@ while(my $e1 = $structIO->read()) {
 
                     next if ($i == $j);
 
-                    my $fmi = fmi($last[$i], $last[$j], $relaxed);
+                    my $fmi = $mfmi ? mfmi($last[$i], $last[$j], $relaxed) : fmi($last[$i], $last[$j], $relaxed);
 
                     if ($fmi >= $minFMI) {
 
@@ -157,7 +158,9 @@ sub help {
  -o or --output       <string>     Output file (Default: non_redundant.db)
  -f or --fmi          <float>      Fowlkes-Mallows index (FMI) threshold to consider two structures 
                                    similar (0-1, Default: 0.9)
- -x  or --relaxed                  When calculating the FMI, a base-pair i-j is considered to be present 
+ -m or --mfmi                      Modified FMI (mFMI), which also takes into account unpaired bases, is
+                                   used instead of traditional FMI for structure comparison
+ -x or --relaxed                   When calculating the FMI, a base-pair i-j is considered to be present 
                                    in both structures also if (i+1)-j, (i-1)-j, i-(j-1), or i-(j+1) exists
  -c or --consensus                 When two structures are within the similarity threshold, instead of
                                    retaining a random one, the consensus structure is retained (so the
