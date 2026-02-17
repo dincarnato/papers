@@ -1,0 +1,803 @@
+#!/usr/bin/env perl
+
+##
+#  diffShape
+#
+#  Identifies bases or regions of differential SHAPE reactivity
+#  between two conditions 
+##
+
+use strict;
+use File::Basename;
+use File::Path qw(mkpath);
+use Getopt::Long qw(:config no_ignore_case);
+use threads;
+use threads::shared;
+
+# If needed, replace this with the actual path to RNA Framework's lib/ directory
+use lib "/path/to/RNAFramework/lib";
+
+use Core::Utils;
+use Core::Mathematics qw(:all);
+use Core::Statistics;
+use Data::Sequence::Utils;
+use RF::Data::IO::XML;
+use Term::Progress;
+
+$|++;
+
+my ($treatDirs, $ctrlDirs, $compareAll, $upDiffThresh,
+    $downDiffThresh, $upSimThresh, $downSimThresh, $outDir, 
+    $overwrite, $threads, $minDiff, $help, $minComparisons, 
+    $analysisMode, $winLengths, $simThresh, $diffThresh,
+    $spearman, $reactCap, $minBasesInWin, $winOffset, 
+    $keepBases, $nMinComparisons, $distMaxValues, @winLengths, 
+    @treatDirs, @ctrlDirs, @pool, %files, %winParams);
+
+my $progressBar : shared;
+my $failedXML : shared;
+my @files : shared;
+my @dist : shared;
+my %baseStats : shared;
+
+%baseStats = ( sameBases => 0,
+               diffBases => 0,
+               allBases  => 0 );
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"             => \$help,
+                "o|outputDir=s"      => \$outDir,
+                "ow|overwrite"       => \$overwrite,
+                "p|processors=s"     => \$threads,
+                "t|treatments=s"     => \$treatDirs,
+                "c|controls=s"       => \$ctrlDirs,
+                "u|upDiffThresh=s"   => \$upDiffThresh,
+                "d|downDiffThresh=s" => \$downDiffThresh,
+                "U|upSimThresh=s"    => \$upSimThresh,
+                "D|downSimThresh=s"  => \$downSimThresh,
+                "m|minDiff=s"        => \$minDiff,
+                "a|compareAll"       => \$compareAll,
+                "n|minComparisons=s" => \$minComparisons,
+                "w|winLengths=s"     => \$winLengths,
+                "f|winOffset=s"      => \$winOffset,
+                "st|simThresh=s"     => \$simThresh,
+                "dt|diffThresh=s"    => \$diffThresh,
+                "mb|minBasesInWin=s" => \$minBasesInWin,
+                "kb|keepBases"       => \$keepBases,
+                "S|spearman"         => \$spearman,
+                "C|capReact=s"       => \$reactCap,
+                "mv|distMaxValues=s" => \$distMaxValues ) or help(1);
+
+    $analysisMode = $ARGV[0];
+
+};
+
+help() if ($help);
+
+$threads ||= 1;
+$minDiff ||= 0.1;
+$minComparisons ||= 0.8;
+$upDiffThresh ||= 1;
+$downDiffThresh ||= -1;
+$upSimThresh ||= $upDiffThresh;
+$downSimThresh ||= $downDiffThresh;
+$winLengths ||= "10,20,30,40,50";
+$winOffset ||= 1;
+$minBasesInWin ||= 0.8;
+$reactCap ||= 1.5;
+$keepBases ||= "ACGT";
+$distMaxValues ||= 0;
+$failedXML = 0;
+
+die "\n  [!] Error: No analysis mode specified (must be either \"base\" or \"region\")\n\n" if (!$analysisMode);
+die "\n  [!] Error: Invalid analysis mode \"$analysisMode\"\n\n" if ($analysisMode !~ /^(?:base|region)$/);
+die "\n  [!] Error: Number of processors must be an INT >= 1\n\n" if (!isint($threads) || !ispositive($threads));
+die "\n  [!] Error: Minimum difference must be >= 0\n\n" if (!ispositive($minDiff));
+die "\n  [!] Error: Minimum comparisons must be comprised between > 0 and 1\n\n" if (!inrange($minComparisons, [0, 1]) || !$minComparisons);
+die "\n  [!] Error: No treatments specified\n\n" if (!defined $treatDirs);
+die "\n  [!] Error: No controls specified\n\n" if (!defined $ctrlDirs);
+
+@treatDirs = split /,/, $treatDirs;
+@ctrlDirs = split /,/, $ctrlDirs;
+
+for (@treatDirs) { die "\n  [!] Error: Treatment \"$_\" does not point to a directory\n\n" if (!-d $_); }
+for (@ctrlDirs) { die "\n  [!] Error: Control \"$_\" does not point to a directory\n\n" if (!-d $_); }
+
+die "\n  [!] Error: Paired analysis requires a matching number of controls and treatments\n\n" if (!$compareAll && @ctrlDirs != @treatDirs);
+
+if ($analysisMode eq "base") {
+
+    die "\n  [!] Error: Upregulation threshold (upDiffThresh) must be > 0\n\n" if (!ispositive($upDiffThresh) || !$upDiffThresh);
+    die "\n  [!] Error: Upregulation threshold (upSimThresh) must be >= 0\n\n" if (!ispositive($upSimThresh));
+    die "\n  [!] Error: Downregulation threshold (downDiffThresh) must be < 0\n\n" if (!isnegative($downDiffThresh));
+    die "\n  [!] Error: Downregulation threshold (downSimThresh) must be <= 0\n\n" if (!isnegative($downSimThresh) && $downDiffThresh);
+
+    $outDir ||= "diffBases_" . sprintf("%.2f", $downDiffThresh) . "-" . sprintf("%.2f", $upDiffThresh);
+
+}
+else {
+
+    die "\n  [!] Error: Window offset must be a positive INT >= 1\n\n" if (!isint($winOffset) || $winOffset < 1);
+    die "\n  [!] Error: Reactivity cap must be > 0\n\n" if (!isnumeric($reactCap) || $reactCap <= 0);
+    die "\n  [!] Error: Minimum number of bases in window must be a positive value comprised between 0 and 1, or >= 3\n\n" if (!ispositive($minBasesInWin) || (!inrange($minBasesInWin, [0, 1]) && $minBasesInWin < 3));
+    die "\n  [!] Error: Invalid reactive bases\n\n" if ($keepBases !~ /^all$/i && !isiupac($keepBases));
+    die "\n  [!] Error: No window length(s) specified\n\n" if (!defined $winLengths);
+    die "\n  [!] Error: The maximum number of values for the distribution must be a positive INT >= 0\n\n" if (!ispositive($distMaxValues) || !isint($distMaxValues));
+
+    @winLengths = split /,/, $winLengths;
+
+    for (@winLengths) { 
+        
+        die "\n  [!] Error: Window lengths must be a positive INT >= 3\n\n" if (!isint($_) || $_ < 3); 
+        die "\n  [!] Error: Window offset cannot exceed window's length ($winOffset > $_)\n\n" if ($_ < $winOffset);
+
+    }
+
+    $outDir ||= "diffRegions_" . join("-", @winLengths) . "nt";
+    $keepBases =~ /^all$/i ? "ACGT" : join("", sort(uniq(split("", join("", iupac2nt(rna2dna(uc($keepBases))))))));
+
+    foreach my $thresh (["sim", $simThresh], ["diff", $diffThresh]) {
+
+        next if (!defined $thresh->[1]);
+
+        my @thresh = split /,/, $thresh->[1];
+
+        if (@thresh == 1) { @thresh = (@thresh) x @winLengths; }
+        elsif (@thresh != @winLengths) { die "\n  [!] Error: Invalid number of " . $thresh->[0] . "Thresh values (" . scalar(@thresh) . " provided, " . scalar(@winLengths) . " expected)\n\n"; }
+
+        for (@thresh) { die "\n  [!] Error: " . $thresh->[0] . "Thresh values must be comprised between -1 and 1\n\n" if (!inrange($_, [-1, 1])); }
+
+        foreach my $winLen (@winLengths) { $winParams{$winLen}->{$thresh->[0]} = shift(@thresh); }
+
+    }
+
+}
+
+$nMinComparisons = ($compareAll ? @ctrlDirs * @treatDirs : @ctrlDirs) * $minComparisons;
+$outDir =~ s/\/?$/\//;
+
+print "\n[+] Making output directory...";
+
+if (-e $outDir) {
+
+    if ($overwrite) {
+
+        my $error = rmtree($outDir);
+
+        die "\n\n  [!] Error: $error\n\n" if ($error);
+
+    }
+    else { die "\n\n  [!] Error: Output directory already exists." .
+               "\n    Please use -ow (or --overwrite) to overwrite output directory\n\n"; }
+
+}
+
+if (my $error = mktree($outDir)) {
+    
+    die "\n\n  [!] Error: Unable to create output directory." .
+        "\n             $error\n\n";
+
+}
+
+print "\n[+] Identifying common transcripts...";
+
+foreach my $sample ((map { [$_, "ctrl"] } @ctrlDirs), (map { [$_, "treat"] } @treatDirs)) {
+
+    opendir(my $dh, $sample->[0]) or die "\n\n  [!] Error: Unable to read from directory \"" . $sample->[0] . "\" ($!)\n\n";
+    while(my $file = readdir($dh)) {
+
+        next if (substr($file, -4) ne ".xml" || substr($file, 0, 1) eq ".");
+
+        $files{$file}->{$sample->[1]}++;
+
+    }
+    closedir($dh);
+
+}
+
+@files = grep { $compareAll ? $files{$_}->{"ctrl"} * $files{$_}->{"treat"} >= $nMinComparisons
+                            : ($files{$_}->{"ctrl"} == $files{$_}->{"treat"} && $files{$_}->{"ctrl"} >= $nMinComparisons) } keys %files;
+
+print " " . scalar(@files) . " found.";
+
+die "\n\n  [!] Error: No transcripts shared across all controls/treatments\n\n" if (!scalar(@files));
+
+$progressBar = shareDataStruct(Term::Progress->new( max     => scalar(@files),
+                                                    width   => 50,
+                                                    colored => 1 ));
+
+if ($analysisMode eq "base") { # Diff base analysis
+
+    print "\n[+] Identifying bases. Please wait...\n\n";
+
+    $progressBar->init();
+
+    @pool = map{ threads->create(\&callDiffBases) } 1 .. $threads;
+    $_->join() for (@pool);
+
+    print "\n\n[i] Total analyzed bases: " . $baseStats{allBases} .
+        "\n    Differential bases:   " . $baseStats{diffBases} . 
+        "\n    Unchanged bases:      " . $baseStats{sameBases} . "\n";
+
+    print "\n  [!] Warning: $failedXML corrupted XML files were skipped\n" if ($failedXML);
+
+    die "\n  [!] Error: Analysis failed, no bases analyzed\n\n" if (!$baseStats{allBases});
+
+    print "\n[+] Sorting bases...";
+
+    system("LC_ALL=C sort -k 1,1 -k 2,2n $outDir/.un*.bed > $outDir/unchanged.bed");
+    system("LC_ALL=C sort -k 1,1 -k 2,2n $outDir/.diff*.bed > $outDir/differential.bed");
+    system("LC_ALL=C sort -k 1,1 -k 2,2n $outDir/.all*.bed > $outDir/all.bed");
+
+    unlink(glob("$outDir/.*"));
+
+}
+else { # Diff region analysis
+
+    my @tmpFiles = @files;
+
+    if (!defined $simThresh || !defined $diffThresh) {
+
+        die "\n\n  [!] Error: Impossible to estimate distributions without at least one replicate condition...\n\n" if (@ctrlDirs < 2 && @treatDirs < 2);
+
+        my $startTime = time;
+
+        print "\n[+] Estimating distributions. This might take a while...\n\n";
+
+        foreach my $winLen (@winLengths) {
+
+            $progressBar->init("Window length: $winLen nt");
+
+            @pool = map{ threads->create(\&calcDists, $winLen) } 1 .. $threads;
+            $_->join() for (@pool);
+
+            $progressBar->status("Calculating distribution parameters");
+
+            die "\n\n [!] Error: Unable to calculate distribution parameters for $winLen nt-long window\n\n" if (!@dist);
+
+            my ($min, $perc25, $median, $perc75, $max) = distribution(@dist);
+            $winParams{$winLen}->{sim} = $median if (!defined $simThresh);
+            $winParams{$winLen}->{diff} = $perc25 if (!defined $diffThresh);
+
+            @dist = ();
+            @files = @tmpFiles;
+
+            $progressBar->reset();
+
+        }
+
+        $progressBar->status("Completed in " . formatTime(time - $startTime));
+
+        print "\n\n[i] Parameters:\n";
+        print "\n    [*] $_ nt [simThresh: " . sprintf("%.3f", $winParams{$_}->{sim}) . ", diffThresh: " . sprintf("%.3f", $winParams{$_}->{diff}) . "]" for (@winLengths);
+        print "\n";
+
+        open(my $wh, ">", "$outDir/params.out") or die "\n  [!] Error: Unable to write parameters to file ($!)\n\n";
+        select((select($wh), $|=1)[0]);
+        print $wh join("\t", "#winLen", "diffThresh", "simThresh") . "\n";
+        print $wh join("\t", $_, $winParams{$_}->{sim}, $winParams{$_}->{diff}) . "\n" for (@winLengths);
+        close($wh);
+
+    }
+
+    print "\n[+] Identifying regions. Please wait...\n\n";
+
+    foreach my $winLen (@winLengths) {
+
+        $progressBar->init("Window length: $winLen nt");
+
+        @pool = map{ threads->create(\&callDiffRegions, $winLen) } 1 .. $threads;
+        $_->join() for (@pool);
+
+        $progressBar->status("Sorting regions");
+
+        system("LC_ALL=C sort -k 1,1 -k 2,2n $outDir/.un*.bed > $outDir/unchanged_${winLen}nt.bed");
+        system("LC_ALL=C sort -k 1,1 -k 2,2n $outDir/.diff*.bed > $outDir/differential_${winLen}nt.bed");
+
+        unlink(glob("$outDir/.*"));
+        @files = @tmpFiles;
+
+        $progressBar->reset();
+
+    }
+
+    print "\n\n[+] Combining regions into non-redundant sets...";
+
+    system("LC_ALL=C sort -k 1,1 -k 2,2n $outDir/unchanged_*nt.bed > $outDir/.un.bed");
+    system("LC_ALL=C sort -k 1,1 -k 2,2n $outDir/differential_*nt.bed > $outDir/.diff.bed");
+
+    _mergeBed(".un.bed", "unchanged_all.bed");
+    _mergeBed(".diff.bed", "differential_all.bed");
+
+    my ($totSameRegions, $totDiffRegions);
+    ($totSameRegions, $baseStats{sameBases}) = _regionStats("unchanged_all.bed");
+    ($totDiffRegions, $baseStats{diffBases}) = _regionStats("differential_all.bed");
+
+    print "\n\n[i] Differential regions:   $totDiffRegions (spanning " . $baseStats{diffBases} . " nt)" . 
+          "\n    Unchanged bases:      $totSameRegions (spanning " . $baseStats{sameBases} . " nt)\n";
+
+    print "\n  [!] Warning: $failedXML corrupted XML files were skipped\n" if ($failedXML);
+
+    die "\n  [!] Error: Analysis failed, no regions analyzed\n\n" if (!$totDiffRegions && !$totSameRegions);
+
+}
+
+print "\n[+] All done.\n\n";
+
+sub calcDists {
+
+    my $winLen = shift; 
+
+    my (@distPart);
+
+    FILE:
+    while (1) {
+
+        my ($file);
+
+        { lock(@files);
+          $file = shift(@files) if (@files); }
+
+        last unless(defined $file);
+
+        { lock($progressBar);
+          $progressBar->update(1); }
+
+        my ($id, $sequence, $length, %reacts);
+        
+        foreach my $dir (\@ctrlDirs, \@treatDirs) {
+
+            next if (@$dir < 2);
+
+            foreach my $i (0 .. $#{$dir}) {
+
+                foreach my $j ($i + 1 .. $#{$dir}) {
+
+                    my ($xml1, $xml2);
+                
+                    eval { 
+                        
+                        $xml1 = RF::Data::IO::XML->new(file => $dir->[$i] . "/$file"); 
+                        $xml2 = RF::Data::IO::XML->new(file => $dir->[$j] . "/$file");
+
+                    };
+
+                    if ($@) {
+
+                        lock($failedXML);
+                        $failedXML++;
+
+                        next FILE;
+
+                    }
+
+                    my ($sequence, @react1, @react2);
+                    $sequence = $xml1->sequence();
+                    @react1 = $xml1->reactivity();
+                    @react2 = $xml2->reactivity();
+
+                    for (my $start = 0; $start < @react1 - $winLen; $start += $winOffset) {
+
+                        my ($end, $winSeq, $nBases, @win1, @win2, @i);
+                        $end = $start + $winLen - 1;
+                        $winSeq = rna2dna(substr($sequence, $start, $winLen));
+                        $nBases = () = $winSeq =~ /[$keepBases]/g;
+                        @win1 = @react1[$start .. $end];
+                        @win2 = @react2[$start .. $end];
+                        @i = grep { isnumeric($win1[$_], $win2[$_]) && substr($winSeq, $_, 1) =~ /^[$keepBases]$/ } 0 .. $#win1;
+
+                        next if (($minBasesInWin <= 1 && @i < $nBases * $minBasesInWin) ||
+                                ($minBasesInWin >= 3 && @i < $minBasesInWin) || @i < 3);
+                        
+                        @win1 = @win1[@i];
+                        @win2 = @win2[@i];
+
+                        push(@distPart, (_correlate(\@win1, \@win2, { rmNaN => 1, cap => $reactCap }))[0]);
+
+                        last FILE if ($distMaxValues && @distPart + @dist >= $distMaxValues);
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    { lock(@dist); 
+      push(@dist, grep { $_ ne "NaN" } @distPart); }
+
+}
+
+sub callDiffBases {
+
+    my ($diffPart, $samePart, $allPart) = (0, 0, 0);
+
+    open(my $sh, ">>", "$outDir/.un" . threads->tid() . ".bed") or return;
+    open(my $dh, ">>", "$outDir/.diff" . threads->tid() . ".bed") or return;
+    open(my $ah, ">>", "$outDir/.all" . threads->tid() . ".bed") or return;
+
+    FILE:
+    while (1) {
+
+        my ($file);
+
+        { lock(@files);
+          $file = shift(@files) if (@files); }
+
+        last unless(defined $file);
+
+        { lock($progressBar);
+          $progressBar->update(1); }
+
+        my ($id, $sequence, $length, @pos, %reacts);
+        
+        foreach my $sample ((map { [$_, "treat"] } @treatDirs), 
+                            (map { [$_, "ctrl"] } @ctrlDirs)) {
+
+            my ($xml);
+            
+            eval { $xml = RF::Data::IO::XML->new(file => $sample->[0] . "/$file"); };
+
+            if ($@) {
+
+                lock($failedXML);
+                $failedXML++;
+
+                next FILE;
+
+            }
+
+            if (!defined $id) {
+
+                $id = $xml->id();
+                $sequence = $xml->sequence();
+                $length = $xml->length();
+
+            }
+
+            push(@{$reacts{$sample->[1]}}, [ $xml->reactivity() ]);
+
+        }
+
+        @pos = grep { substr($sequence, $_, 1) =~ /^[$keepBases]$/ } 0 .. $length - 1;
+
+        for my $i (@pos) {
+
+            my (@ctrl, @treat, @folds, @diffs);
+            @ctrl = map { $reacts{"ctrl"}->[$_]->[$i] } 0 .. $#{$reacts{"ctrl"}};
+            @treat = map { $reacts{"treat"}->[$_]->[$i] } 0 .. $#{$reacts{"treat"}};
+            
+            if ($compareAll) {
+
+                @ctrl = grep { isnumeric($_) } @ctrl;
+                @treat = grep { isnumeric($_) } @treat;
+
+                next if (@ctrl * @treat < $nMinComparisons);
+
+                for my $treat (@treat) {
+
+                    for my $ctrl (@ctrl) {
+
+                        push(@folds, logarithm(($treat + 0.001) / ($ctrl + 0.001), 2));
+                        push(@diffs, abs($treat - $ctrl));
+
+                    }
+
+                }
+
+            }
+            else {
+
+                my @i = grep { isnumeric($ctrl[$_], $treat[$_]) } 0 .. $#ctrl;
+
+                next if (@i < $nMinComparisons);
+
+                @ctrl = @ctrl[@i];
+                @treat = @treat[@i];
+
+                for my $i (0 .. $#ctrl) {
+
+                    push(@folds, logarithm(($treat[$i] + 0.001) / ($ctrl[$i] + 0.001), 2));
+                    push(@diffs, abs($treat[$i] - $ctrl[$i]));
+
+                }
+
+            }
+
+            my $base = join("\t", $id, $i, $i + 1, join(",", map {sprintf "%.3f", $_ } @ctrl), join(",", map {sprintf "%.3f", $_ } @treat), join(",", map {sprintf "%.3f", $_ } @folds));
+
+            if (((scalar(grep { $_ >= $upDiffThresh } @folds) >= $nMinComparisons && ispositive(grep { $_ >= $upDiffThresh } @folds)) || 
+		         (scalar(grep { $_ <= $downDiffThresh } @folds) >= $nMinComparisons && isnegative(grep { $_ >= $downDiffThresh } @folds))) &&
+		        scalar(grep { $_ >= $minDiff } @diffs) >= $nMinComparisons ) {
+
+                print $dh "$base\n";
+                $diffPart++;
+
+            }
+	        elsif (scalar(grep { $_ < $upSimThresh && $_ > $downSimThresh } @folds) >= $nMinComparisons ||
+                   scalar(grep { $_ < $minDiff } @diffs) >= $nMinComparisons) {
+
+                print $sh "$base\n";
+                $samePart++;
+
+            }
+
+            print $ah "$base\n";
+            $allPart++;
+
+        }
+
+    }
+
+    close($_) for ($sh, $dh, $ah);
+
+    { lock(%baseStats);
+      
+      $baseStats{sameBases} += $samePart;
+      $baseStats{diffBases} += $diffPart;
+      $baseStats{allBases} += $allPart; }
+
+}
+
+sub callDiffRegions {
+
+    my $winLen = shift;
+
+    open(my $sh, ">>", "$outDir/.un" . threads->tid() . ".bed") or return;
+    open(my $dh, ">>", "$outDir/.diff" . threads->tid() . ".bed") or return;
+
+    FILE:
+    while (1) {
+
+        my ($file);
+
+        { lock(@files);
+          $file = shift(@files) if (@files); }
+
+        last unless(defined $file);
+
+        { lock($progressBar);
+          $progressBar->update(1); }
+
+        my ($id, $sequence, $length, %reacts);
+        
+        foreach my $sample ((map { [$_, "treat"] } @treatDirs), 
+                            (map { [$_, "ctrl"] } @ctrlDirs)) {
+
+            my ($xml);
+            
+            eval { $xml = RF::Data::IO::XML->new(file => $sample->[0] . "/$file"); };
+
+            if ($@) {
+
+                lock($failedXML);
+                $failedXML++;
+
+                next FILE;
+
+            }
+
+            if (!defined $id) {
+
+                $id = $xml->id();
+                $sequence = $xml->sequence();
+                $length = $xml->length();
+
+            }
+
+            push(@{$reacts{$sample->[1]}}, [ $xml->reactivity() ]);
+
+        }
+
+        for (my $start = 0; $start < $length - $winLen; $start += $winOffset) {
+
+            my ($end, $winSeq, $nBases, $passingSimThresh,
+                $passingDiffThresh, @ctrl, @treat, @i, 
+                @ctrlCorr, @treatCorr, @interCorr);
+            $end = $start + $winLen - 1;
+            $winSeq = rna2dna(substr($sequence, $start, $winLen));
+            $nBases = () = $winSeq =~ /[$keepBases]/g;
+            @ctrl = map { [ @{$reacts{"ctrl"}->[$_]}[$start .. $end] ] } 0 .. $#{$reacts{"ctrl"}};
+            @treat = map { [ @{$reacts{"treat"}->[$_]}[$start .. $end] ] } 0 .. $#{$reacts{"treat"}};
+            @i = grep { substr($winSeq, $_, 1) =~ /^[$keepBases]$/ } 0 .. $winLen - 1;
+
+            for my $react (@ctrl, @treat) { @i = grep { isnumeric($react->[$_]) } @i; }
+
+            next if (($minBasesInWin <= 1 && @i < $nBases * $minBasesInWin) ||
+                     ($minBasesInWin >= 3 && @i < $minBasesInWin) || @i < 3);
+
+            @ctrl = map { [ @{$_}[@i] ] } @ctrl;
+            @treat = map { [ @{$_}[@i] ] } @treat;
+
+            for my $i (0 .. $#ctrl) { for my $j ($i + 1 .. $#ctrl) { push(@ctrlCorr, (_correlate($ctrl[$i], $ctrl[$j], { rmNaN => 1, cap => $reactCap }))[0]); } }
+
+            next if (scalar(grep { $_ >= $winParams{$winLen}->{sim} } @ctrlCorr) < $minComparisons * @ctrlCorr);
+
+            for my $i (0 .. $#treat) { for my $j ($i + 1 .. $#treat) { push(@treatCorr, (_correlate($treat[$i], $treat[$j], { rmNaN => 1, cap => $reactCap }))[0]); } }
+
+            next if (scalar(grep { $_ >= $winParams{$winLen}->{sim} } @treatCorr) < $minComparisons * @treatCorr);
+
+            if ($compareAll) {
+
+                for my $treat (@treat) {
+
+                    for my $ctrl (@ctrl) {
+
+                        push(@interCorr, (_correlate($ctrl, $treat, { rmNaN => 1, cap => $reactCap }))[0]);
+
+                    }
+
+                }
+
+            }
+            else {
+
+                for my $i (0 .. $#ctrl) {
+
+                    push(@interCorr, (_correlate($ctrl[$i], $treat[$i], { rmNaN => 1, cap => $reactCap }))[0]);
+
+                }
+
+            }
+
+            $passingDiffThresh = scalar(grep { $_ <= $winParams{$winLen}->{diff} } @interCorr);
+            $passingSimThresh = scalar(grep { $_ >= $winParams{$winLen}->{sim} } @interCorr);
+
+            my $region = join("\t", $id, $start, $end + 1, join(",", map {sprintf "%.3f", $_ } @ctrlCorr), join(",", map {sprintf "%.3f", $_ } @treatCorr), join(",", map {sprintf "%.3f", $_ } @interCorr));
+
+            if ($passingDiffThresh >= $nMinComparisons && !$passingSimThresh) { print $dh "$region\n"; }
+	        elsif ($passingSimThresh >= $nMinComparisons) { print $sh "$region\n"; }
+
+        }
+
+    }
+
+    close($_) for ($sh, $dh);
+
+}
+
+sub _correlate { 
+
+    if (scalar(uniq(@{$_[0]})) == 1 || scalar(uniq(@{$_[1]})) == 1) { return("NaN"); }
+    else { return($spearman ? spearman(@_) : pearson(@_)); }
+    
+}
+
+sub _mergeBed {
+
+    my ($in, $out) = @_;
+
+    if (my $mergeBed = which("mergeBed")) { system("cut -f 1,2,3 $outDir/$in | $mergeBed > $outDir/$out"); }
+    else {
+
+        my ($lastId, $lastStart, $lastEnd);
+
+        open(my $fh, "<", "$outDir/$in") or die "\n\n  [!] Error: Unable to read input BED file ($!)\n\n";
+        open(my $wh, ">", "$outDir/$out") or die "\n\n  [!] Error: Unable to write output BED file ($!)\n\n";
+        select((select($wh), $|=1)[0]);
+
+        while(<$fh>) {
+
+            chomp;
+            my @line = split /\t/;
+
+            if ($lastId ne $line[0] || 
+                ($lastId eq $line[0] && $lastEnd < $line[1])) {
+
+                print $wh join("\t", $lastId, $lastStart, $lastEnd) . "\n" if (defined $lastId);
+
+                ($lastId, $lastStart, $lastEnd) = @line[0..2];
+
+            }
+            else { $lastEnd = $line[2]; }
+
+        }
+
+        print $wh join("\t", $lastId, $lastStart, $lastEnd) . "\n" if (defined $lastId);
+
+        close($fh);
+        close($wh);
+
+    }
+
+    unlink("$outDir/$in");
+
+}
+
+sub _regionStats {
+
+    my $file = shift;
+
+    my ($totRegions, $totBases) = (0, 0);
+
+    open(my $fh, "<", "$outDir/$file") or "\n\n  [!] Error: Unable to read from BED file \"$file\" ($!)\n\n";
+    while(<$fh>) {
+
+        chomp;
+
+        my @line = split /\t/;
+        $totBases += $line[2] - $line[1];
+        $totRegions++;
+
+    }
+
+    return($totRegions, $totBases);
+
+}
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ diffShape (using RNA Framework libs v$Core::Utils::VERSION)
+
+ Summary: Identifies bases or regions of differential SHAPE reactivity between two conditions 
+
+ Usage:   diffShape <base|region> [Options] -c ctrl1_dir,ctrl2_dir,...,ctrln_dir \
+                                            -t treat1_dir,treat2_dir,...,treatn_dir
+
+ Options                                   Description
+ -p  or --processors         <int>         Number of processors to use (>=1, Default: 1)
+ -o  or --output             <string>      Output folder (Default: diffBases_<fold-change_range>/ for base analysis,
+                                                                   diffRegions_<window_sizes>/ for region analysis)
+ -ow or --overwrite                        Overwrites output folder (if the specified folder already exists)
+ -c  or --controls           <string>      A comma-separated list of XML directories for the control experiments
+ -t  or --treatments         <string>      A comma-separated list of XML directories for the treatment experiments
+ -a  or --compareAll                       When enabled, this parameter will cause every possible comparison between
+                                           all control and treatment experiments, to be performed (so, for example,
+                                           if 3 replicates were provided for both control and treatment, then 9 
+                                           comparisons will be performed)
+                                           Note: by default, a paired analysis is performed, therefore the same
+                                           number of replicates (provided in the same order) is expected for both
+                                           control and treatment. 
+ -m  or --minComparisons     <float>       Minimum fraction of all comparisons that needs to pass the thresholds for
+                                           a base to be considered as differentially reactive (0-1, Default: 0.8)
+ -kb or --keepBases          <string>      Bases to be keep for the analysis (Default: all)
+                                           Note: IUPAC codes are allowed
+
+ Base analysis mode-specific parameters
+ -u  or --upDiffThresh       <float>       Minimum fold-change (log2 scale) to consider a base upregulated in
+                                           in the treatment (>0, Default: 1)
+ -d  or --downDiffThresh     <float>       Minimum fold-change (log2 scale) to consider a base downregulated in
+                                           in the treatment (<0, Default: -1)
+ -U  or --upSimThresh        <float>       Maximum fold-change (log2 scale) to consider a base unchanged between
+                                           treatment and control (>=0, Default: same as --upDiffThresh)
+ -D  or --downSimThresh      <float>       Maximum fold-change (log2 scale) to consider a base unchanged between
+                                           treatment and control (<=0, Default: same as --downDiffThresh)
+ -m  or --minDiff            <float>       Minimum absolute reactivity difference between treatment and control
+                                           to consider a base as differentially reactive (>=0, Default: 0.1)
+
+ Region analysis mode-specific parameters
+ -w  or --winLengths         <string>      Comma-separated list of window lengths to be used (Default: 10,20,30,40,50)
+ -f  or --winOffset          <int>         Offset for window sliding (>=1, Default: 1)
+ -mb or --minBasesInWin      <float>       Minimum number of informative bases to retain a window (0-1 or >=3, Default: 0.8)
+                                           Note: when a float between 0 and 1 is provided, this is interpreted as the fraction
+                                                 of bases (for example, with -kb AC -mb 0.5, >= 50% of the A/C bases in the
+                                                 window must be a non-NaN). When an integer >= 3 is provided, this is interpreted
+                                                 as the absolute number of bases.
+ -C  or --capReact           <float>       Reactivities will be capped to this value for correlation calculation (>0, Default: 1.5)
+ -S  or --spearman                         Uses Spearman instead of Pearson for correlation calculation
+ -st or --simThresh          <float>       Below this correlation threshold a region is considered to be unchanged between treatment
+                                           and control (-1-1, Default: automatically defermined [recommended])
+                                           Note: when no value is specified, the program analyzes the distribution of inter-replicate
+                                                 correlations, and sets as the similarity threshold the median of the distribution.
+                                                 This analysis is performed for each window length independently.
+ -dt or --diffThresh         <float>       Above this correlation threshold a region is considered to be differentially-structured
+                                           between treatment and control (-1-1, Default: automatically defermined [recommended])
+                                           Note: when no value is specified, the program analyzes the distribution of inter-replicate
+                                                 correlations, and sets as the differential threshold the 25th percentile of the 
+                                                 distribution. This analysis is performed for each window length independently.
+ -mv or --distMaxValues      <int>         Thresholds will be estimated as soon as the distribution of correlations reaches at least
+                                           this size (faster) (>=0, Default: use all windows)
+
+HELP
+
+}
