@@ -23,6 +23,7 @@ use Core::Statistics;
 use Data::Sequence::Utils;
 use RF::Data::IO::XML;
 use Term::Progress;
+use Term::Table;
 
 $|++;
 
@@ -39,10 +40,6 @@ my $failedXML : shared;
 my @files : shared;
 my @dist : shared;
 my %baseStats : shared;
-
-%baseStats = ( sameBases => 0,
-               diffBases => 0,
-               allBases  => 0 );
 
 do {
 
@@ -218,13 +215,30 @@ if ($analysisMode eq "base") { # Diff base analysis
     @pool = map{ threads->create(\&callDiffBases) } 1 .. $threads;
     $_->join() for (@pool);
 
+    die "\n\n  [!] Error: Analysis failed, no bases analyzed\n\n" if (!$baseStats{allBases});
+
     print "\n\n[i] Total analyzed bases: " . $baseStats{allBases} .
         "\n    Differential bases:   " . $baseStats{diffBases} . 
-        "\n    Unchanged bases:      " . $baseStats{sameBases} . "\n";
+        "\n    Unchanged bases:      " . $baseStats{sameBases} . "\n\n";
+
+    my $table = Term::Table->new(indent => 4);
+    $table->head("Base", "Observed", "Expected", "p-value", "");
+
+    for (qw(A C G T)) { 
+        
+        my ($obs, $exp);
+        $obs = $baseStats{diffBases} ? sprintf("%.3f", $baseStats{"diff$_"} / $baseStats{diffBases}) : "NaN";
+        $exp = $baseStats{sameBases} ? sprintf("%.3f", $baseStats{"same$_"} / $baseStats{sameBases}) : "NaN";
+        $table->row($_, $obs, $exp, 
+                    ($baseStats{diffBases} ? sprintf("%.3e", binomialTest($baseStats{"diff$_"}, $baseStats{diffBases}, (isnumeric($exp) && $exp ? $exp : 1e-308))) : "NaN"),
+                    (isnumeric($obs, $exp) ? ($obs > $exp ? "Enriched" : ($obs < $exp ? "Depleted" : "")) : ""));
+    
+    }
+
+    $table->print();
+    print "\n";
 
     print "\n  [!] Warning: $failedXML corrupted XML files were skipped\n" if ($failedXML);
-
-    die "\n  [!] Error: Analysis failed, no bases analyzed\n\n" if (!$baseStats{allBases});
 
     print "\n[+] Sorting bases...";
 
@@ -316,7 +330,7 @@ else { # Diff region analysis
     ($totSameRegions, $baseStats{sameBases}) = _regionStats("unchanged_all.bed");
     ($totDiffRegions, $baseStats{diffBases}) = _regionStats("differential_all.bed");
 
-    print "\n\n[i] Differential regions:   $totDiffRegions (spanning " . $baseStats{diffBases} . " nt)" . 
+    print "\n\n[i] Differential regions: $totDiffRegions (spanning " . $baseStats{diffBases} . " nt)" . 
           "\n    Unchanged bases:      $totSameRegions (spanning " . $baseStats{sameBases} . " nt)\n";
 
     print "\n  [!] Warning: $failedXML corrupted XML files were skipped\n" if ($failedXML);
@@ -428,7 +442,10 @@ sub calcDists {
 
 sub callDiffBases {
 
-    my ($diffPart, $samePart, $allPart) = (0, 0, 0);
+    my %baseStatsPart = ( sameBases => 0,
+                          diffBases => 0,
+                          allBases  => 0,
+                          (map { "diff" . $_ => 0, "same" . $_ => 0 } qw(A C G T)) );
 
     open(my $sh, ">>", "$outDir/.un" . threads->tid() . ".bed") or return;
     open(my $dh, ">>", "$outDir/.diff" . threads->tid() . ".bed") or return;
@@ -528,20 +545,22 @@ sub callDiffBases {
 		         (scalar(grep { $_ <= $downDiffThresh } @folds) >= $nMinComparisons && isnegative(grep { $_ >= $downDiffThresh } @folds))) &&
 		        scalar(grep { $_ >= $minDiff } @diffs) >= $nMinComparisons) {
 
+                $baseStatsPart{"diff" . substr($sequence, $i, 1)}++;
                 print $dh "$base\n";
-                $diffPart++;
+                $baseStatsPart{diffBases}++;
 
             }
 	        elsif (scalar(grep { $_ < $upSimThresh && $_ > $downSimThresh } @folds) >= $nMinComparisons ||
                    scalar(grep { $_ < $minDiff } @diffs) >= $nMinComparisons) {
 
+                $baseStatsPart{"same" . substr($sequence, $i, 1)}++;
                 print $sh "$base\n";
-                $samePart++;
+                $baseStatsPart{sameBases}++;
 
             }
 
             print $ah "$base\n";
-            $allPart++;
+            $baseStatsPart{allBases}++;
 
         }
 
@@ -550,10 +569,7 @@ sub callDiffBases {
     close($_) for ($sh, $dh, $ah);
 
     { lock(%baseStats);
-      
-      $baseStats{sameBases} += $samePart;
-      $baseStats{diffBases} += $diffPart;
-      $baseStats{allBases} += $allPart; }
+      $baseStats{$_} += $baseStatsPart{$_} for (keys %baseStatsPart); }
 
 }
 
