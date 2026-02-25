@@ -241,7 +241,7 @@ else { # Diff region analysis
 
     if (!defined $simThresh || !defined $diffThresh) {
 
-        die "\n\n  [!] Error: Impossible to estimate distributions without at least one replicate condition...\n\n" if (@ctrlDirs < 2 && @treatDirs < 2);
+        die "\n\n  [!] Error: Impossible to estimate distributions without at least 2 replicates per condition...\n\n" if (@ctrlDirs < 2 || @treatDirs < 2);
 
         my $startTime = time;
 
@@ -346,64 +346,76 @@ sub calcDists {
         { lock($progressBar);
           $progressBar->update(1); }
 
-        my ($id, $sequence, $length, %reacts);
+        my ($id, $sequence, $length, @reacts);
         
         foreach my $dir (\@ctrlDirs, \@treatDirs) {
 
             next if (@$dir < 2);
 
+            push(@reacts, []);
+
             foreach my $i (0 .. $#{$dir}) {
 
-                foreach my $j ($i + 1 .. $#{$dir}) {
+                my ($eval, $xml);
+                $eval = do { local $@;
+                             eval { $xml = RF::Data::IO::XML->new(file => $dir->[$i] . "/$file"); };
+                             $@; };
 
-                    my ($xml1, $xml2);
-                
-                    eval { 
-                        
-                        $xml1 = RF::Data::IO::XML->new(file => $dir->[$i] . "/$file"); 
-                        $xml2 = RF::Data::IO::XML->new(file => $dir->[$j] . "/$file");
+                if (!$eval) {
 
-                    };
+                    $id = $xml->id();
+                    $sequence = $xml->sequence();
+                    $length = $xml->length();
+                    push(@{$reacts[-1]}, [ $xml->reactivity() ]);
 
-                    if ($@) {
+                }
 
-                        lock($failedXML);
-                        $failedXML++;
+            }
 
-                        next FILE;
+        }
 
-                    }
+        next if (min(map { scalar(@$_) } @reacts) < 2);
 
-                    my ($sequence, @react1, @react2);
-                    $sequence = $xml1->sequence();
-                    @react1 = $xml1->reactivity();
-                    @react2 = $xml2->reactivity();
+        for (my $start = 0; $start < $length - $winLen; $start += $winOffset) {
 
-                    for (my $start = 0; $start < @react1 - $winLen; $start += $winOffset) {
+            my ($end, $winSeq, $nBases, @winCorrs, @baseIdx);
+            $end = $start + $winLen - 1;
+            $winSeq = rna2dna(substr($sequence, $start, $winLen));
+            $nBases = () = $winSeq =~ /[$keepBases]/g;
+            @baseIdx = grep { substr($winSeq, $_, 1) =~ /^[$keepBases]$/ } 0 .. $winLen - 1;
 
-                        my ($end, $winSeq, $nBases, @win1, @win2, @i);
-                        $end = $start + $winLen - 1;
-                        $winSeq = rna2dna(substr($sequence, $start, $winLen));
-                        $nBases = () = $winSeq =~ /[$keepBases]/g;
-                        @win1 = @react1[$start .. $end];
-                        @win2 = @react2[$start .. $end];
-                        @i = grep { isnumeric($win1[$_], $win2[$_]) && substr($winSeq, $_, 1) =~ /^[$keepBases]$/ } 0 .. $#win1;
+            foreach my $set (@reacts) {
+
+                push(@winCorrs, []);
+
+                for my $i (0 .. $#{$set}) {
+
+                    for my $j ($i + 1 .. $#{$set}) {
+
+                        my (@win1, @win2, @i);
+                        @win1 = @{$set->[$i]}[$start .. $end];
+                        @win2 = @{$set->[$j]}[$start .. $end];
+                        @i = grep { isnumeric($win1[$_], $win2[$_]) } @baseIdx;
 
                         next if (($minBasesInWin <= 1 && @i < $nBases * $minBasesInWin) ||
-                                ($minBasesInWin >= 3 && @i < $minBasesInWin) || @i < 3);
-                        
+                                 ($minBasesInWin >= 3 && @i < $minBasesInWin) || @i < 3);
+
                         @win1 = @win1[@i];
                         @win2 = @win2[@i];
 
-                        push(@distPart, (_correlate(\@win1, \@win2, { rmNaN => 1, cap => $reactCap }))[0]);
-
-                        last FILE if ($distMaxValues && @distPart + @dist >= $distMaxValues);
+                        push(@{$winCorrs[-1]}, (_correlate(\@win1, \@win2, { rmNaN => 1, cap => $reactCap }))[0]);
 
                     }
 
                 }
 
             }
+
+            next if (!min(map { scalar(@$_) } @winCorrs));
+
+            push(@distPart, map { @$_ } @winCorrs);
+
+            last FILE if ($distMaxValues && @distPart + @dist >= $distMaxValues);
 
         }
 
@@ -514,7 +526,7 @@ sub callDiffBases {
 
             if (((scalar(grep { $_ >= $upDiffThresh } @folds) >= $nMinComparisons && ispositive(grep { $_ >= $upDiffThresh } @folds)) || 
 		         (scalar(grep { $_ <= $downDiffThresh } @folds) >= $nMinComparisons && isnegative(grep { $_ >= $downDiffThresh } @folds))) &&
-		        scalar(grep { $_ >= $minDiff } @diffs) >= $nMinComparisons ) {
+		        scalar(grep { $_ >= $minDiff } @diffs) >= $nMinComparisons) {
 
                 print $dh "$base\n";
                 $diffPart++;
