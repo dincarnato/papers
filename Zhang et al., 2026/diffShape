@@ -168,7 +168,7 @@ if (-e $outDir) {
 
     }
     else { die "\n\n  [!] Error: Output directory already exists." .
-               "\n    Please use -ow (or --overwrite) to overwrite output directory\n\n"; }
+               "\n      Please use -ow (or --overwrite) to overwrite output directory\n\n"; }
 
 }
 
@@ -238,7 +238,7 @@ if ($analysisMode eq "base") { # Diff base analysis
     $table->print();
     print "\n";
 
-    print "\n  [!] Warning: $failedXML corrupted XML files were skipped\n" if ($failedXML);
+    print "\n  [!] Warning: $failedXML corrupted/missing XML files were skipped\n" if ($failedXML);
 
     print "\n[+] Sorting bases...";
 
@@ -331,9 +331,9 @@ else { # Diff region analysis
     ($totDiffRegions, $baseStats{diffBases}) = _regionStats("differential_all.bed");
 
     print "\n\n[i] Differential regions: $totDiffRegions (spanning " . $baseStats{diffBases} . " nt)" . 
-          "\n    Unchanged bases:      $totSameRegions (spanning " . $baseStats{sameBases} . " nt)\n";
+          "\n    Unchanged regions:    $totSameRegions (spanning " . $baseStats{sameBases} . " nt)\n";
 
-    print "\n  [!] Warning: $failedXML corrupted XML files were skipped\n" if ($failedXML);
+    print "\n  [!] Warning: $failedXML corrupted/missing XML files were skipped\n" if ($failedXML);
 
     die "\n  [!] Error: Analysis failed, no regions analyzed\n\n" if (!$totDiffRegions && !$totSameRegions);
 
@@ -469,11 +469,12 @@ sub callDiffBases {
         foreach my $sample ((map { [$_, "treat"] } @treatDirs), 
                             (map { [$_, "ctrl"] } @ctrlDirs)) {
 
-            my ($xml);
-            
-            eval { $xml = RF::Data::IO::XML->new(file => $sample->[0] . "/$file"); };
+            my ($eval, $xml);
+            $eval = do { local $@;
+                         eval { $xml = RF::Data::IO::XML->new(file => $sample->[0] . "/$file"); };
+                         $@; };
 
-            if ($@) {
+            if ($eval) {
 
                 lock($failedXML);
                 $failedXML++;
@@ -598,11 +599,12 @@ sub callDiffRegions {
         foreach my $sample ((map { [$_, "treat"] } @treatDirs), 
                             (map { [$_, "ctrl"] } @ctrlDirs)) {
 
-            my ($xml);
-            
-            eval { $xml = RF::Data::IO::XML->new(file => $sample->[0] . "/$file"); };
+            my ($eval, $xml);
+            $eval = do { local $@;
+                         eval { $xml = RF::Data::IO::XML->new(file => $sample->[0] . "/$file"); };
+                         $@; };
 
-            if ($@) {
+            if ($eval) {
 
                 lock($failedXML);
                 $failedXML++;
@@ -610,7 +612,7 @@ sub callDiffRegions {
                 next FILE;
 
             }
-
+            
             if (!defined $id) {
 
                 $id = $xml->id();
@@ -786,7 +788,7 @@ sub help {
                                            Note: by default, a paired analysis is performed, therefore the same
                                            number of replicates (provided in the same order) is expected for both
                                            control and treatment. 
- -m  or --minComparisons     <float>       Minimum fraction of all comparisons that needs to pass the thresholds for
+ -n  or --minComparisons     <float>       Minimum fraction of all comparisons that needs to pass the thresholds for
                                            a base to be considered as differentially reactive (0-1, Default: 0.8)
  -kb or --keepBases          <string>      Bases to be keep for the analysis (Default: all)
                                            Note: IUPAC codes are allowed
